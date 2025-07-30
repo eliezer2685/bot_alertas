@@ -9,13 +9,16 @@ import asyncio
 import datetime
 import time
 from telegram import Bot
+from dotenv import load_dotenv
 
-# 🔹 Configuración desde variables de entorno
+# 🔹 Cargar variables de entorno desde .env
+load_dotenv()
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 if not TELEGRAM_TOKEN or not CHAT_ID:
-    raise ValueError("⚠️ Falta configurar TELEGRAM_TOKEN o CHAT_ID en variables de entorno")
+    raise ValueError("⚠️ Faltan variables de entorno TELEGRAM_TOKEN o CHAT_ID")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
@@ -35,6 +38,7 @@ coins = [
     "ENJ/USDT","ZIL/USDT","HNT/USDT","RUNE/USDT","CRV/USDT","1INCH/USDT"
 ]
 
+# 🔹 Archivo para guardar últimas monedas usadas
 HISTORY_FILE = "last_coins.json"
 
 def load_last_coins():
@@ -51,12 +55,13 @@ def select_random_coins(n=20):
     last_coins = load_last_coins()
     available = [c for c in coins if c not in last_coins]
     if len(available) < n:
-        available = coins
+        available = coins  # Si se acaban, reinicia
     selected = random.sample(available, n)
     save_last_coins(selected)
     return selected
 
 def fetch_ohlcv_safe(symbol, retries=3):
+    """Intenta descargar OHLCV con reintentos"""
     for attempt in range(retries):
         try:
             return exchange.fetch_ohlcv(symbol, timeframe='1h', limit=150)
@@ -85,14 +90,15 @@ def get_signal(symbol):
     df['macd'] = macd.macd()
     df['macd_signal'] = macd.macd_signal()
 
-    bb = ta.volatility.BollingerBands(close, window=20)
+    # 🔹 Corrección: BollingerBands usa `window_dev` en ta 0.10
+    bb = ta.volatility.BollingerBands(close, window=20, window_dev=2)
     df['bb_low'] = bb.bollinger_lband()
 
     df['vol_mean20'] = df['volume'].rolling(20).mean()
-
     atr = ta.volatility.AverageTrueRange(df['high'], df['low'], close, window=14)
     df['atr'] = atr.average_true_range()
 
+    # Nuevos indicadores
     df['cci'] = ta.trend.CCIIndicator(df['high'], df['low'], close, window=20).cci()
     stoch = ta.momentum.StochasticOscillator(df['high'], df['low'], close, window=14, smooth_window=3)
     df['stoch_k'] = stoch.stoch()
@@ -106,7 +112,6 @@ def get_signal(symbol):
     prev = df.iloc[-2]
     signals = []
 
-    # Estrategias
     if last.rsi < 35 and last.ema20 > last.ema50 and last.close > last.ema200:
         signals.append("RSI+EMAs (rebote alcista)")
 
@@ -166,7 +171,7 @@ def loop_trading_bot():
         hour = datetime.datetime.now().hour
         if 6 <= hour <= 22:
             asyncio.run(send_alerts())
-        time.sleep(3600)  # cada hora
+        time.sleep(3600)
 
 if __name__ == "__main__":
     loop_trading_bot()
