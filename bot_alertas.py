@@ -10,18 +10,22 @@ import datetime
 import time
 from telegram import Bot
 
-# 🔹 Configuración del Bot
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8130687378:AAFLSy-BVZ3oAtMgft5mC4GwqtYuOZEu8a4")
-CHAT_ID = os.getenv("CHAT_ID", "6158517156")
+# 🔹 Configuración desde variables de entorno
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+if not TELEGRAM_TOKEN or not CHAT_ID:
+    raise ValueError("⚠️ Falta configurar TELEGRAM_TOKEN o CHAT_ID en variables de entorno")
+
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# 🔹 Conexión a Binance con rate limit y ajuste de hora
+# 🔹 Conexión a Binance
 exchange = ccxt.binance({
     'enableRateLimit': True,
     'options': {'adjustForTimeDifference': True}
 })
 
-# 🔹 Lista ampliada de criptos (36 monedas)
+# 🔹 Lista de criptos
 coins = [
     "BTC/USDT","ETH/USDT","BNB/USDT","ADA/USDT","XRP/USDT","DOGE/USDT",
     "SOL/USDT","DOT/USDT","MATIC/USDT","LTC/USDT","AVAX/USDT","TRX/USDT",
@@ -31,7 +35,6 @@ coins = [
     "ENJ/USDT","ZIL/USDT","HNT/USDT","RUNE/USDT","CRV/USDT","1INCH/USDT"
 ]
 
-# 🔹 Archivo para guardar últimas monedas usadas
 HISTORY_FILE = "last_coins.json"
 
 def load_last_coins():
@@ -48,19 +51,18 @@ def select_random_coins(n=20):
     last_coins = load_last_coins()
     available = [c for c in coins if c not in last_coins]
     if len(available) < n:
-        available = coins  # Si se acaban, reinicia
+        available = coins
     selected = random.sample(available, n)
     save_last_coins(selected)
     return selected
 
 def fetch_ohlcv_safe(symbol, retries=3):
-    """Intenta descargar OHLCV con reintentos"""
     for attempt in range(retries):
         try:
             return exchange.fetch_ohlcv(symbol, timeframe='1h', limit=150)
         except Exception as e:
             print(f"⚠️ Error {symbol} intento {attempt+1}: {e}")
-            time.sleep(2)  # espera antes de reintentar
+            time.sleep(2)
     return None
 
 def get_signal(symbol):
@@ -83,7 +85,7 @@ def get_signal(symbol):
     df['macd'] = macd.macd()
     df['macd_signal'] = macd.macd_signal()
 
-    bb = ta.volatility.BollingerBands(close=close, window=20, window_dev=2)
+    bb = ta.volatility.BollingerBands(close, window=20)
     df['bb_low'] = bb.bollinger_lband()
 
     df['vol_mean20'] = df['volume'].rolling(20).mean()
@@ -91,7 +93,6 @@ def get_signal(symbol):
     atr = ta.volatility.AverageTrueRange(df['high'], df['low'], close, window=14)
     df['atr'] = atr.average_true_range()
 
-    # Nuevos indicadores
     df['cci'] = ta.trend.CCIIndicator(df['high'], df['low'], close, window=20).cci()
     stoch = ta.momentum.StochasticOscillator(df['high'], df['low'], close, window=14, smooth_window=3)
     df['stoch_k'] = stoch.stoch()
@@ -101,12 +102,11 @@ def get_signal(symbol):
     df['di_plus'] = adx.adx_pos()
     df['di_minus'] = adx.adx_neg()
 
-    # 🔹 Últimos valores
     last = df.iloc[-1]
     prev = df.iloc[-2]
     signals = []
 
-    # 🔹 Estrategias
+    # Estrategias
     if last.rsi < 35 and last.ema20 > last.ema50 and last.close > last.ema200:
         signals.append("RSI+EMAs (rebote alcista)")
 
@@ -159,14 +159,14 @@ async def send_alerts():
         signal = get_signal(coin)
         if signal:
             await bot.send_message(chat_id=CHAT_ID, text=signal)
-        time.sleep(1)  # 🔹 Espera 1s entre requests para no saturar Binance
+        time.sleep(1)
 
 def loop_trading_bot():
     while True:
         hour = datetime.datetime.now().hour
         if 6 <= hour <= 22:
             asyncio.run(send_alerts())
-        time.sleep(3600)
+        time.sleep(3600)  # cada hora
 
 if __name__ == "__main__":
     loop_trading_bot()
