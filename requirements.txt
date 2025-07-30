@@ -4,4 +4,5 @@ numpy==1.26.4
 python-dateutil==2.9.0.post0
 pytz==2024.1
 requests==2.31.0
+ta==0.10.2
 
