@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: bot-alertas
+    env: python
+    plan: free       # o standard si usás plan pago
+    buildCommand: |
+      pip install --upgrade pip setuptools wheel
+      pip install -r requirements.txt
+    startCommand: python main.py  # Cambia 'main.py' por tu archivo principal
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
