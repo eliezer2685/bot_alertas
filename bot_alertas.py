@@ -83,7 +83,7 @@ def get_signal(symbol):
     df['macd'] = macd.macd()
     df['macd_signal'] = macd.macd_signal()
 
-    bb = ta.volatility.BollingerBands(close, window=20, ndev=2)
+    bb = ta.volatility.BollingerBands(close=close, window=20, window_dev=2)
     df['bb_low'] = bb.bollinger_lband()
 
     df['vol_mean20'] = df['volume'].rolling(20).mean()
