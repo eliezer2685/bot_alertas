@@ -1,47 +1,63 @@
 import ccxt
 import pandas as pd
 import ta
-import os
+import random
 import time
+import os
 from datetime import datetime
 from telegram import Bot
 
 # ==============================
-# CONFIGURACIÓN
+# DEBUG DE VARIABLES
 # ==============================
-API_KEY_TELEGRAM = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-BINANCE_KEY = os.getenv("BINANCE_API_KEY")
-BINANCE_SECRET = os.getenv("BINANCE_API_SECRET")
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-if not API_KEY_TELEGRAM or not CHAT_ID or not BINANCE_KEY or not BINANCE_SECRET:
-    print("❌ ERROR: Variables de entorno no configuradas.")
+print("=== DEBUG VARIABLES DE ENTORNO ===")
+print("TELEGRAM_TOKEN:", "OK" if TELEGRAM_TOKEN else "❌ NONE")
+print("CHAT_ID:", CHAT_ID if CHAT_ID else "❌ NONE")
+print("BINANCE_API_KEY:", BINANCE_API_KEY[:4]+"****" if BINANCE_API_KEY else "❌ NONE")
+print("BINANCE_API_SECRET:", BINANCE_API_SECRET[:4]+"****" if BINANCE_API_SECRET else "❌ NONE")
+print("=================================")
+
+if not TELEGRAM_TOKEN or not CHAT_ID or not BINANCE_API_KEY or not BINANCE_API_SECRET:
+    print("❌ ERROR: Variables de entorno no configuradas correctamente.")
+    # Si tenemos token y chat, avisamos por Telegram
+    if TELEGRAM_TOKEN and CHAT_ID:
+        bot = Bot(token=TELEGRAM_TOKEN)
+        bot.send_message(chat_id=CHAT_ID, text="❌ ERROR: Variables de entorno no configuradas.")
     exit(1)
 
-bot = Bot(token=API_KEY_TELEGRAM)
+bot = Bot(token=TELEGRAM_TOKEN)
+
+# ==============================
+# CONFIGURACIÓN DEL BOT
+# ==============================
+INTERVALO_HORAS = 1
+TIMEFRAMES = ['1h', '4h']
+SYMBOLS = [
+    "BTC/USDT","ETH/USDT","BNB/USDT","XRP/USDT","ADA/USDT",
+    "DOGE/USDT","SOL/USDT","MATIC/USDT","DOT/USDT","LTC/USDT",
+    "TRX/USDT","AVAX/USDT","SHIB/USDT","UNI/USDT","ATOM/USDT",
+    "LINK/USDT","XLM/USDT","ETC/USDT","XMR/USDT","NEAR/USDT",
+    "APT/USDT","ARB/USDT","SUI/USDT","OP/USDT","AAVE/USDT",
+    "FIL/USDT","EOS/USDT","THETA/USDT","FLOW/USDT","ALGO/USDT"
+]
 
 exchange = ccxt.binance({
-    'apiKey': BINANCE_KEY,
-    'secret': BINANCE_SECRET,
-    'enableRateLimit': True,
+    'apiKey': BINANCE_API_KEY,
+    'secret': BINANCE_API_SECRET,
     'options': {'defaultType': 'future'}  # FUTUROS
 })
 
-# Configuración de trading
-USDT_AMOUNT = 20          # Tamaño de posición
-STOP_LOSS_USD = 3
-TAKE_PROFIT_USD = 5
-LEVERAGE = 10
-SYMBOLS = ["BTC/USDT","ETH/USDT","BNB/USDT","XRP/USDT"]
-TIMEFRAMES = ['1h', '4h']
+ultimas_senales = set()
 
-# Configura apalancamiento
-for sym in SYMBOLS:
-    try:
-        market = sym.replace("/", "")
-        exchange.fapiPrivate_post_leverage({'symbol': market, 'leverage': LEVERAGE})
-    except Exception as e:
-        print(f"⚠️ No se pudo setear leverage para {sym}: {e}")
+# ==============================
+# INICIO DEL BOT
+# ==============================
+bot.send_message(chat_id=CHAT_ID, text="✅ Bot de Trading iniciado. Variables de entorno OK.")
 
 # ==============================
 # FUNCIONES DE INDICADORES
@@ -64,107 +80,81 @@ def generar_senal(df, symbol, tf):
 
     if ema_fast > ema_slow and macd > macd_signal and rsi < 70:
         tipo = "LONG"
+        fuerza = (rsi / 70) * 0.4 + 0.6
     elif ema_fast < ema_slow and macd < macd_signal and rsi > 30:
         tipo = "SHORT"
+        fuerza = ((100 - rsi) / 70) * 0.4 + 0.6
     else:
         return None
+
+    if tipo == "LONG":
+        sl = round(precio_actual * 0.985, 4)
+        tp1 = round(precio_actual * 1.015, 4)
+        tp2 = round(precio_actual * 1.03, 4)
+    else:
+        sl = round(precio_actual * 1.015, 4)
+        tp1 = round(precio_actual * 0.985, 4)
+        tp2 = round(precio_actual * 0.97, 4)
 
     return {
         "symbol": symbol,
         "tf": tf,
         "tipo": tipo,
-        "precio": float(precio_actual)
+        "precio": round(precio_actual, 4),
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "fuerza": fuerza
     }
 
-# ==============================
-# FUNCIONES DE TRADING
-# ==============================
-def abrir_operacion(señal):
-    symbol = señal['symbol']
-    precio = señal['precio']
-    tipo = señal['tipo']
-    market = symbol.replace("/", "")
+def analizar_moneda(symbol):
+    señales = []
+    for tf in TIMEFRAMES:
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=150)
+            if not ohlcv:
+                continue
 
-    # Verificar balance antes de operar
-    balance = exchange.fetch_balance()
-    usdt_disp = balance['total'].get('USDT', 0)
+            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df = calcular_indicadores(df)
 
-    # Margen necesario
-    margen_requerido = USDT_AMOUNT / LEVERAGE
+            señal = generar_senal(df, symbol, tf)
+            if señal:
+                señales.append(señal)
 
-    # Cantidad de coin según USDT_AMOUNT
-    qty = round(USDT_AMOUNT / precio, 3)
-
-    # Definir SL y TP
-    if tipo == "LONG":
-        sl_price = round(precio - STOP_LOSS_USD / qty, 2)
-        tp_price = round(precio + TAKE_PROFIT_USD / qty, 2)
-        side = "buy"
-        close_side = "sell"
-    else:
-        sl_price = round(precio + STOP_LOSS_USD / qty, 2)
-        tp_price = round(precio - TAKE_PROFIT_USD / qty, 2)
-        side = "sell"
-        close_side = "buy"
-
-    # Si no hay saldo suficiente, enviar alerta de señal potencial
-    if usdt_disp < margen_requerido:
-        mensaje = (f"⚠️ Señal detectada pero SIN saldo suficiente\n"
-                   f"{tipo} en {symbol} ({señal['tf']})\n"
-                   f"💰 Precio: {precio}\n"
-                   f"⛔ SL: {sl_price} | 🎯 TP: {tp_price}\n"
-                   f"💵 Balance disponible: {usdt_disp:.2f} USDT")
-        print(mensaje)
-        bot.send_message(chat_id=CHAT_ID, text=mensaje)
-        return
-
-    try:
-        # Orden Market principal
-        order = exchange.create_market_order(symbol, side, qty)
-
-        # SL
-        exchange.create_order(
-            symbol, 'STOP_MARKET', 
-            close_side, qty, None, {'stopPrice': sl_price}
-        )
-
-        # TP
-        exchange.create_order(
-            symbol, 'TAKE_PROFIT_MARKET', 
-            close_side, qty, None, {'stopPrice': tp_price}
-        )
-
-        mensaje = (f"🚀 Operación {tipo} abierta en {symbol}\n"
-                   f"💰 Entrada: {precio}\n"
-                   f"⛔ SL: {sl_price} | 🎯 TP: {tp_price}\n"
-                   f"📈 Cantidad: {qty} ({USDT_AMOUNT} USDT apalancado x{LEVERAGE})\n"
-                   f"💵 Balance usado: {margen_requerido:.2f} USDT")
-        print(mensaje)
-        bot.send_message(chat_id=CHAT_ID, text=mensaje)
-
-    except Exception as e:
-        mensaje = f"❌ Error abriendo operación {symbol}: {e}"
-        print(mensaje)
-        bot.send_message(chat_id=CHAT_ID, text=mensaje)
+        except Exception as e:
+            print(f"❌ Error en {symbol} {tf}: {e}")
+    return señales
 
 # ==============================
 # LOOP PRINCIPAL
 # ==============================
-if __name__ == "__main__":
-    while True:
-        print(f"🔹 Iniciando análisis {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        for symbol in SYMBOLS:
-            try:
-                for tf in TIMEFRAMES:
-                    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=150)
-                    df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                    df = calcular_indicadores(df)
-                    señal = generar_senal(df, symbol, tf)
-                    if señal:
-                        abrir_operacion(señal)
-            except Exception as e:
-                print(f"❌ Error analizando {symbol}: {e}")
+while True:
+    seleccion = random.sample(SYMBOLS, 30)
+    print(f"🔹 Analizando {len(seleccion)} monedas: {seleccion}")
 
-        print("⏳ Esperando 1 hora para el próximo análisis...")
-        time.sleep(3600)
+    todas_senales = []
+    for symbol in seleccion:
+        todas_senales.extend(analizar_moneda(symbol))
+
+    nuevas_senales = [s for s in todas_senales if f"{s['symbol']}_{s['tf']}_{s['tipo']}" not in ultimas_senales]
+    nuevas_senales.sort(key=lambda x: x['fuerza'], reverse=True)
+    top_senales = nuevas_senales[:10]
+
+    if not top_senales:
+        bot.send_message(chat_id=CHAT_ID, text=f"⏳ Bot activo, sin señales detectadas. {datetime.now().strftime('%H:%M')}")
+
+    for s in top_senales:
+        mensaje = (f"📊 {s['symbol']} | {s['tf']} | {s['tipo']}\n"
+                   f"💰 Entrada: {s['precio']}\n"
+                   f"⛔ SL: {s['sl']}\n"
+                   f"🎯 TP1: {s['tp1']} | TP2: {s['tp2']}\n"
+                   f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        print(mensaje)
+        bot.send_message(chat_id=CHAT_ID, text=mensaje)
+        ultimas_senales.add(f"{s['symbol']}_{s['tf']}_{s['tipo']}")
+
+    print(f"✅ {len(top_senales)} señales enviadas.")
+    print(f"⏳ Esperando {INTERVALO_HORAS} horas para próximo análisis...")
+    time.sleep(INTERVALO_HORAS * 3600)
