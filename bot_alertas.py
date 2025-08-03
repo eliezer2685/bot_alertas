@@ -129,13 +129,13 @@ def heartbeat():
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ Bot activo - {now}")
 
 # 🔹 Scheduler
-schedule.every(5).minutes.do(analyze_market)
+schedule.every(15).minutes.do(analyze_market)  # ⬅️ cada 15 minutos
 schedule.every().hour.do(heartbeat)
 
 # 🔹 Aviso inicial
 bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot de alertas iniciado correctamente y en ejecución...")
 
-print("✅ Bot iniciado. Analiza cada 5 minutos y heartbeat cada 1 hora...")
+print("✅ Bot iniciado. Analiza cada 15 minutos y heartbeat cada 1 hora...")
 while True:
     schedule.run_pending()
     time.sleep(1)
