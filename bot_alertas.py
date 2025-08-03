@@ -1,36 +1,36 @@
-import os, time, datetime, requests, ccxt, pandas as pd, ta, feedparser, csv
+import os, time, datetime, requests, pandas as pd, ta, feedparser, csv
 from textblob import TextBlob
 from telegram import Bot
 import schedule
+from tradingview_ta import TA_Handler, Interval, Exchange
 
-# ===================== 🔹 CONFIGURACIÓN =====================
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
+# 🔹 Variables de entorno
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 
-if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
+if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
     print("❌ ERROR: Variables de entorno no configuradas.")
     exit()
 
-# Conexión a Binance Futures
-binance = ccxt.binance({
-    'apiKey': API_KEY,
-    'secret': API_SECRET,
-    'enableRateLimit': True,
-    'options': {'defaultType': 'future'}
-})
-
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# Archivo CSV histórico
+# 🔹 CSV para histórico
 CSV_FILE = "historico_senales.csv"
 if not os.path.exists(CSV_FILE):
     with open(CSV_FILE, mode='w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(["Fecha", "Moneda", "Señal", "Precio Entrada", "TP", "SL", "Noticia"])
 
-# RSS de noticias sobre criptos
+# 🔹 Lista de 50 monedas de futuros populares en Binance
+symbols = [
+    "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","SOLUSDT","DOGEUSDT","ADAUSDT","TRXUSDT","MATICUSDT","LTCUSDT",
+    "DOTUSDT","SHIBUSDT","AVAXUSDT","UNIUSDT","ATOMUSDT","LINKUSDT","XLMUSDT","FILUSDT","ICPUSDT","APTUSDT",
+    "ARBUSDT","SANDUSDT","MANAUSDT","APEUSDT","AXSUSDT","NEARUSDT","EOSUSDT","FLOWUSDT","XTZUSDT","THETAUSDT",
+    "AAVEUSDT","GRTUSDT","RUNEUSDT","KAVAUSDT","CRVUSDT","FTMUSDT","CHZUSDT","SNXUSDT","LDOUSDT","OPUSDT",
+    "COMPUSDT","DYDXUSDT","BLURUSDT","RNDRUSDT","GMTUSDT","1INCHUSDT","OCEANUSDT","SUIUSDT","PYTHUSDT","JTOUSDT"
+]
+
+# 🔹 RSS de noticias sobre criptos
 news_feeds = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
@@ -44,14 +44,12 @@ news_feeds = [
     "https://beincrypto.com/feed/"
 ]
 
-# ===================== 🔹 FUNCIONES =====================
-
-# Analiza noticias relacionadas a la moneda
+# 🔹 Analiza noticias y devuelve sentimiento
 def check_news(symbol):
-    keyword = symbol.replace("/USDT", "")
+    keyword = symbol.replace("USDT", "")
     for feed in news_feeds:
         d = feedparser.parse(feed)
-        for entry in d.entries[:5]:  # últimas 5 noticias
+        for entry in d.entries[:5]:
             title = entry.title
             if keyword.lower() in title.lower():
                 sentiment = TextBlob(title).sentiment.polarity
@@ -61,46 +59,37 @@ def check_news(symbol):
                     return f"🔴 Noticia negativa: \"{title}\""
     return None
 
-# Obtiene 50 monedas de futuros USDT
-def get_futures_symbols(limit=50):
-    markets = binance.load_markets()
-    futures_symbols = [s for s in markets if s.endswith("/USDT") and markets[s]['type'] == 'future']
-    return futures_symbols[:limit]
-
-# Analiza el mercado
+# 🔹 Estrategia técnica con TradingView
 def analyze_market():
-    symbols = get_futures_symbols(limit=50)
-    print(f"🔍 Analizando {len(symbols)} monedas de futuros...")
-
+    print(f"🔍 Analizando {len(symbols)} monedas...")
     for symbol in symbols:
         try:
-            ohlcv = binance.fetch_ohlcv(symbol, '15m', limit=200)
-            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-            df['close'] = df['close'].astype(float)
+            handler = TA_Handler(
+                symbol=symbol,
+                exchange="BINANCE",
+                screener="crypto",
+                interval=Interval.INTERVAL_15_MINUTES
+            )
 
-            # Indicadores técnicos
-            df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-            macd = ta.trend.MACD(df['close'])
-            df['macd'] = macd.macd()
-            df['macd_signal'] = macd.macd_signal()
-            df['ema50'] = ta.trend.EMAIndicator(df['close'], window=50).ema_indicator()
-            df['ema200'] = ta.trend.EMAIndicator(df['close'], window=200).ema_indicator()
+            analysis = handler.get_analysis()
+            close_price = analysis.indicators["close"]
+            rsi = analysis.indicators["RSI"]
+            macd = analysis.indicators["MACD.macd"]
+            macd_signal = analysis.indicators["MACD.signal"]
+            ema50 = analysis.indicators["EMA50"]
+            ema200 = analysis.indicators["EMA200"]
 
-            last = df.iloc[-1]
             signal = None
-
-            # Estrategia combinada
-            if last['rsi'] < 30 and last['macd'] > last['macd_signal'] and last['ema50'] > last['ema200']:
+            if rsi < 30 and macd > macd_signal and ema50 > ema200:
                 signal = "LONG"
-            elif last['rsi'] > 70 and last['macd'] < last['macd_signal'] and last['ema50'] < last['ema200']:
+            elif rsi > 70 and macd < macd_signal and ema50 < ema200:
                 signal = "SHORT"
 
             if signal:
-                price = last['close']
+                price = close_price
                 tp = round(price * (1.02 if signal == "LONG" else 0.98), 6)
                 sl = round(price * (0.98 if signal == "LONG" else 1.02), 6)
 
-                # Revisar noticias
                 news = check_news(symbol)
                 msg = (
                     f"🔔 Señal Detectada\n"
@@ -114,11 +103,9 @@ def analyze_market():
                 if news:
                     msg += f"{news}\n"
 
-                # Enviar a Telegram
                 bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
                 print(f"📤 Señal enviada: {symbol} {signal}")
 
-                # Guardar histórico
                 with open(CSV_FILE, mode='a', newline='') as f:
                     writer = csv.writer(f)
                     writer.writerow([datetime.datetime.now(), symbol, signal, price, tp, sl, news if news else ""])
@@ -126,17 +113,17 @@ def analyze_market():
         except Exception as e:
             print(f"⚠️ Error analizando {symbol}: {e}")
 
-# Heartbeat cada 1 hora
+# 🔹 Heartbeat cada 1 hora
 def heartbeat():
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ Bot activo - {now}")
 
-# ===================== 🔹 SCHEDULER =====================
+# 🔹 Scheduler
 schedule.every(15).minutes.do(analyze_market)
 schedule.every().hour.do(heartbeat)
 
-# Aviso inicial
-bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot de alertas iniciado correctamente y en ejecución...")
+# 🔹 Aviso inicial
+bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot de alertas TradingView iniciado correctamente...")
 
 print("✅ Bot iniciado. Analiza cada 15 minutos y heartbeat cada 1 hora...")
 while True:
