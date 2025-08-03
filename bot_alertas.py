@@ -1,10 +1,10 @@
-import os, time, datetime, requests, pandas as pd, ta, feedparser, csv
+import os, time, datetime, csv
+import requests, pandas as pd, feedparser, schedule
 from textblob import TextBlob
 from telegram import Bot
-import schedule
-from tradingview_ta import TA_Handler, Interval, Exchange
+from tradingview_ta import TA_Handler, Interval
 
-# 🔹 Variables de entorno
+# 🔹 Variables de entorno (Render)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 
@@ -21,7 +21,7 @@ if not os.path.exists(CSV_FILE):
         writer = csv.writer(f)
         writer.writerow(["Fecha", "Moneda", "Señal", "Precio Entrada", "TP", "SL", "Noticia"])
 
-# 🔹 Lista de 50 monedas de futuros populares en Binance
+# 🔹 50 pares SPOT populares
 symbols = [
     "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","SOLUSDT","DOGEUSDT","ADAUSDT","TRXUSDT","MATICUSDT","LTCUSDT",
     "DOTUSDT","SHIBUSDT","AVAXUSDT","UNIUSDT","ATOMUSDT","LINKUSDT","XLMUSDT","FILUSDT","ICPUSDT","APTUSDT",
@@ -30,7 +30,7 @@ symbols = [
     "COMPUSDT","DYDXUSDT","BLURUSDT","RNDRUSDT","GMTUSDT","1INCHUSDT","OCEANUSDT","SUIUSDT","PYTHUSDT","JTOUSDT"
 ]
 
-# 🔹 RSS de noticias sobre criptos
+# 🔹 RSS de noticias
 news_feeds = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
@@ -59,16 +59,16 @@ def check_news(symbol):
                     return f"🔴 Noticia negativa: \"{title}\""
     return None
 
-# 🔹 Estrategia técnica con TradingView
+# 🔹 Estrategia técnica
 def analyze_market():
-    print(f"🔍 Analizando {len(symbols)} monedas...")
+    print(f"🔍 Analizando {len(symbols)} monedas spot...")
     for symbol in symbols:
         try:
             handler = TA_Handler(
                 symbol=symbol,
                 exchange="BINANCE",
                 screener="crypto",
-                interval=Interval.INTERVAL_15_MINUTES
+                interval=Interval.INTERVAL_15_MINUTES  # ahora cada 15 min
             )
 
             analysis = handler.get_analysis()
@@ -78,11 +78,13 @@ def analyze_market():
             macd_signal = analysis.indicators["MACD.signal"]
             ema50 = analysis.indicators["EMA50"]
             ema200 = analysis.indicators["EMA200"]
+            volume = analysis.indicators["volume"]
 
+            # Filtramos señales de alta probabilidad
             signal = None
-            if rsi < 30 and macd > macd_signal and ema50 > ema200:
+            if rsi < 30 and macd > macd_signal and ema50 > ema200 and volume > 0:
                 signal = "LONG"
-            elif rsi > 70 and macd < macd_signal and ema50 < ema200:
+            elif rsi > 70 and macd < macd_signal and ema50 < ema200 and volume > 0:
                 signal = "SHORT"
 
             if signal:
@@ -92,13 +94,13 @@ def analyze_market():
 
                 news = check_news(symbol)
                 msg = (
-                    f"🔔 Señal Detectada\n"
+                    f"🔔 Señal {signal} Detectada\n"
                     f"Moneda: {symbol}\n"
-                    f"Tipo: {signal}\n"
                     f"Entrada: {price}\n"
                     f"TP: {tp}\n"
                     f"SL: {sl}\n"
-                    f"Apalancamiento sugerido: x10\n"
+                    f"Volumen: {volume}\n"
+                    f"Apalancamiento sugerido: x3\n"
                 )
                 if news:
                     msg += f"{news}\n"
@@ -113,7 +115,7 @@ def analyze_market():
         except Exception as e:
             print(f"⚠️ Error analizando {symbol}: {e}")
 
-# 🔹 Heartbeat cada 1 hora
+# 🔹 Heartbeat
 def heartbeat():
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ Bot activo - {now}")
@@ -122,8 +124,7 @@ def heartbeat():
 schedule.every(15).minutes.do(analyze_market)
 schedule.every().hour.do(heartbeat)
 
-# 🔹 Aviso inicial
-bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot de alertas TradingView iniciado correctamente...")
+bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot Spot iniciado correctamente (15 min)...")
 
 print("✅ Bot iniciado. Analiza cada 15 minutos y heartbeat cada 1 hora...")
 while True:
