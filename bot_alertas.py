@@ -1,87 +1,124 @@
-import ccxt
-import pandas as pd
-import ta
-import os
-import time
-import datetime
-import requests
+import os, time, datetime, feedparser, requests, ccxt, pandas as pd, ta
+from textblob import TextBlob
+import random
 
-# === Variables de entorno ===
+# === Configuración ===
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
-
-if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
-    print("❌ ERROR: Variables de entorno no configuradas.")
+if not all([TELEGRAM_TOKEN, CHAT_ID, API_KEY, API_SECRET]):
+    print("❌ Variables de entorno faltantes")
     exit()
 
-# === Configuración Binance Futures ===
-binance = ccxt.binance({
+exchange = ccxt.binance({
     'apiKey': API_KEY,
     'secret': API_SECRET,
     'enableRateLimit': True,
     'options': {'defaultType': 'future'}
 })
 
-# === Lista de criptos para análisis ===
-symbols = [
-    'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 
-    'ADA/USDT', 'MATIC/USDT', 'LTC/USDT', 'DOT/USDT', 'AVAX/USDT', 'TRX/USDT',
-    'LINK/USDT', 'ATOM/USDT', 'ETC/USDT', 'XLM/USDT', 'NEAR/USDT', 'APT/USDT',
-    'OP/USDT', 'ARB/USDT', 'AAVE/USDT', 'SAND/USDT', 'MANA/USDT', 'EOS/USDT',
-    'FTM/USDT', 'GALA/USDT', 'RNDR/USDT', 'RUNE/USDT', 'INJ/USDT', 'LDO/USDT',
-    'DYDX/USDT', 'CRO/USDT', 'FIL/USDT', 'THETA/USDT', 'FLOW/USDT', 'IMX/USDT',
-    'CHZ/USDT', 'QNT/USDT', 'KAVA/USDT', 'SNX/USDT', '1INCH/USDT'
+RSS_FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+    "https://www.theblock.co/feed",
+    "https://cryptonews.com/news/feed",
+    "https://bitcoinmagazine.com/.rss/full/",
+    "https://coinjournal.net/feed/",
+    "https://www.investing.com/rss/news_301.rss",
+    "https://coingape.com/feed/",
+    "https://u.today/rss"
 ]
 
-# === Función para enviar mensajes a Telegram ===
-def send_telegram(msg):
+SYMBOLS = [
+    'BTC/USDT','ETH/USDT','BNB/USDT','SOL/USDT','XRP/USDT','DOGE/USDT','ADA/USDT',
+    'MATIC/USDT','DOT/USDT','AVAX/USDT','LTC/USDT','LINK/USDT','ATOM/USDT','NEAR/USDT',
+    'FTM/USDT','APT/USDT','AAVE/USDT','SAND/USDT','MANA/USDT','FIL/USDT','THETA/USDT',
+    'FLOW/USDT','EGLD/USDT','GALA/USDT','CHZ/USDT','VET/USDT','XLM/USDT','TRX/USDT',
+    'UNI/USDT','ETC/USDT','EOS/USDT','ALGO/USDT','ICP/USDT','CFX/USDT','LDO/USDT',
+    'DYDX/USDT','GRT/USDT','OP/USDT','ARB/USDT','STX/USDT','IMX/USDT'
+]
+
+CSV_FILE = "historial_senales.csv"
+if not os.path.exists(CSV_FILE):
+    pd.DataFrame(columns=['fecha','symbol','operacion','precio','tp','sl','apalancamiento','sentimiento']).to_csv(CSV_FILE, index=False)
+
+# === Funciones ===
+
+def enviar_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
-# === Estrategia de señal ===
-def get_signal(df):
-    df['EMA20'] = ta.trend.ema_indicator(df['close'], window=20)
-    df['EMA50'] = ta.trend.ema_indicator(df['close'], window=50)
-    df['RSI'] = ta.momentum.rsi(df['close'], window=14)
-    df['MACD'] = ta.trend.macd(df['close'])
-    df['MACD_signal'] = ta.trend.macd_signal(df['close'])
-    df['ADX'] = ta.trend.adx(df['high'], df['low'], df['close'], window=14)
+def fetch_news():
+    news = []
+    for feed in RSS_FEEDS:
+        try:
+            f = feedparser.parse(feed)
+            for entry in f.entries[:5]:
+                news.append({'title': entry.get('title',''), 'summary': entry.get('summary','')})
+        except: pass
+    return news
 
+def get_sentiment(text):
+    p = TextBlob(text).sentiment.polarity
+    return 'positive' if p>0.1 else ('negative' if p< -0.1 else 'neutral')
+
+def technical_signal(symbol):
+    df = pd.DataFrame(exchange.fetch_ohlcv(symbol, '1h', limit=200),
+                      columns=['t','o','h','l','c','v'])
+    df['c']=df['c'].astype(float)
+    df['EMA50']=ta.trend.ema_indicator(df['c'],50)
+    df['EMA200']=ta.trend.ema_indicator(df['c'],200)
+    df['RSI']=ta.momentum.rsi(df['c'],14)
+    df['MACD']=ta.trend.macd_diff(df['c'])
     last = df.iloc[-1]
-    prev = df.iloc[-2]
+    if last['EMA50']>last['EMA200'] and last['MACD']>0 and last['RSI']<70:
+        return 'LONG'
+    if last['EMA50']<last['EMA200'] and last['MACD']<0 and last['RSI']>30:
+        return 'SHORT'
+    return None
 
-    # Señal de compra
-    if last['EMA20'] > last['EMA50'] and last['RSI'] > 55 and last['MACD'] > last['MACD_signal'] and last['ADX'] > 20:
-        return "BUY"
-    # Señal de venta
-    elif last['EMA20'] < last['EMA50'] and last['RSI'] < 45 and last['MACD'] < last['MACD_signal'] and last['ADX'] > 20:
-        return "SELL"
-    else:
-        return None
+def process_cycle():
+    news = fetch_news()
+    sent_sent = []
+    alerts = 0
+    for symbol in SYMBOLS:
+        if alerts>=3: break
+        txt = " ".join([n['title']+" "+n['summary'] for n in news])
+        sentiment = 'neutral'
+        if symbol.split('/')[0] in txt:
+            sentiment = get_sentiment(txt)
+        sig = technical_signal(symbol)
+        if sig and ((sig=='LONG' and sentiment=='positive') or (sig=='SHORT' and sentiment=='negative')):
+            send_alert(symbol, sig, strong=True)
+            alerts+=1
+        elif sig and sentiment=='neutral' and random.random()>0.7:
+            send_alert(symbol, sig, strong=False)
+            alerts+=1
 
-# === Loop principal cada 2 horas, solo 06-22 AR ===
+def send_alert(symbol, operation, strong):
+    price = exchange.fetch_ticker(symbol)['last']
+    tp = round(price*(1.02 if operation=='LONG' else 0.98),4)
+    sl = round(price*(0.98 if operation=='LONG' else 1.02),4)
+    lev = 'x5-x10' if strong else 'x3-x5'
+    fecha = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    row = {'fecha':fecha,'symbol':symbol,'operacion':operation,'precio':price,'tp':tp,'sl':sl,'apalancamiento':lev,'sentimiento':'strong' if strong else 'tecnico'}
+    pd.DataFrame([row]).to_csv(CSV_FILE, mode='a', header=False, index=False)
+    enviar_telegram(f"""📊 Señal {operation} {symbol}
+Entrada: {price}
+TP: {tp} | SL: {sl}
+Apalancamiento: {lev}
+Fuente: {'noticia+técnico' if strong else 'solo técnico'}
+""")
+
+# === Loop principal ===
+
 while True:
-    hora_arg = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-3))).hour
-    if 6 <= hora_arg <= 22:
-        señales = []
-        for symbol in symbols:
-            try:
-                ohlcv = binance.fetch_ohlcv(symbol, timeframe='15m', limit=100)
-                df = pd.DataFrame(ohlcv, columns=['time','open','high','low','close','volume'])
-                signal = get_signal(df)
-                if signal:
-                    señales.append(f"{symbol}: {signal}")
-            except Exception as e:
-                print(f"Error con {symbol}: {e}")
-
-        if señales:
-            mensaje = "🚨 Señales detectadas:\n" + "\n".join(señales)
-            send_telegram(mensaje)
-            print(mensaje)
-        else:
-            print("⏳ Sin señales en esta ronda.")
-
-    # Espera 2 horas
-    time.sleep(60*60*2)
+    hr = datetime.datetime.now().hour
+    if 6 <= hr <= 22 and hr%3==0:
+        process_cycle()
+        print("✅ ciclo enviado", datetime.datetime.now())
+        time.sleep(3*3600)
+    else:
+        time.sleep(600)
