@@ -1,10 +1,15 @@
-import os, time, datetime, requests, pandas as pd, numpy as np, ta, csv
-from telegram import Bot
+import os
+import time
+import datetime
+import pandas as pd
+import numpy as np
+import requests
 import schedule
-import feedparser
-from textblob import TextBlob
+from telegram import Bot
 
-# --- Variables de entorno para Telegram ---
+# ============================
+# 🔹 Configuración de Telegram
+# ============================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 
@@ -14,14 +19,9 @@ if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# --- CSV para histórico ---
-CSV_FILE = "historico_senales.csv"
-if not os.path.exists(CSV_FILE):
-    with open(CSV_FILE, mode='w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["Fecha", "Moneda", "Señal", "Precio Entrada", "TP", "SL", "RSI", "Noticia"])
-
-# --- Lista de 50 monedas Spot ---
+# ============================
+# 🔹 Lista de 50 monedas Spot
+# ============================
 symbols = [
     "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","SOLUSDT","DOGEUSDT","ADAUSDT","TRXUSDT","MATICUSDT","LTCUSDT",
     "DOTUSDT","SHIBUSDT","AVAXUSDT","UNIUSDT","ATOMUSDT","LINKUSDT","XLMUSDT","FILUSDT","ICPUSDT","APTUSDT",
@@ -30,160 +30,110 @@ symbols = [
     "COMPUSDT","DYDXUSDT","BLURUSDT","RNDRUSDT","GMTUSDT","1INCHUSDT","OCEANUSDT","SUIUSDT","PYTHUSDT","JTOUSDT"
 ]
 
-# --- Feeds de noticias ---
-news_feeds = [
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "https://cointelegraph.com/rss",
-    "https://news.bitcoin.com/feed/",
-    "https://cryptoslate.com/feed/",
-    "https://decrypt.co/feed",
-    "https://bitcoinmagazine.com/feed",
-    "https://u.today/rss",
-    "https://ambcrypto.com/feed/",
-    "https://cryptopotato.com/feed/",
-    "https://beincrypto.com/feed/"
-]
-
-# --- Últimas señales enviadas para evitar repeticiones ---
-last_signals = {}  # { "BTCUSDT_LONG": timestamp }
-
-# --- Función para buscar noticias ---
-def check_news(symbol):
-    keyword = symbol.replace("USDT", "")
-    for feed in news_feeds:
-        d = feedparser.parse(feed)
-        for entry in d.entries[:5]:
-            title = entry.title
-            if keyword.lower() in title.lower():
-                sentiment = TextBlob(title).sentiment.polarity
-                if sentiment > 0.1:
-                    return f"🟢 Noticia positiva: \"{title}\""
-                elif sentiment < -0.1:
-                    return f"🔴 Noticia negativa: \"{title}\""
-    return None
-
-# --- Indicadores técnicos ---
-def rsi(series, period=14):
-    return ta.momentum.RSIIndicator(series, window=period).rsi()
-
-def ema(series, period):
-    return ta.trend.EMAIndicator(series, window=period).ema_indicator()
-
-def atr(df, period=14):
-    return ta.volatility.AverageTrueRange(
-        df['high'], df['low'], df['close'], window=period
-    ).average_true_range()
-
-# --- Obtener datos de Binance Spot ---
+# ============================
+# 🔹 Obtener velas de Binance
+# ============================
 def get_klines(symbol, interval="15m", limit=200):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    data = requests.get(url).json()
-    if isinstance(data, dict) and data.get("code"):
-        print(f"⚠️ Error Binance: {data}")
+    try:
+        data = requests.get(url, timeout=10).json()
+        if isinstance(data, dict) and "code" in data:
+            print(f"⚠️ Error Binance: {data}")
+            return None
+        df = pd.DataFrame(data, columns=[
+            'time','open','high','low','close','volume','close_time','qav','num_trades','taker_base','taker_quote','ignore'
+        ])
+        df['time'] = pd.to_datetime(df['time'], unit='ms')
+        df['close'] = df['close'].astype(float)
+        df['volume'] = df['volume'].astype(float)
+        return df[['time','close','volume']]
+    except Exception as e:
+        print(f"⚠️ Error obteniendo velas para {symbol}: {e}")
         return None
-    df = pd.DataFrame(data, columns=[
-        "timestamp","open","high","low","close","volume",
-        "close_time","quote_volume","trades","tb_base","tb_quote","ignore"
-    ])
-    df = df.astype(float)
-    return df[["open","high","low","close","volume"]]
 
-# --- Estrategia de análisis ---
+# ============================
+# 🔹 Indicadores Técnicos
+# ============================
+def calculate_indicators(df):
+    df['EMA50'] = df['close'].ewm(span=50).mean()
+    df['EMA200'] = df['close'].ewm(span=200).mean()
+
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    return df
+
+# ============================
+# 🔹 Analizar mercado
+# ============================
+last_signals = {}
+
 def analyze_market():
-    print(f"🔍 Analizando {len(symbols)} pares Spot...")
+    print(f"\n🔍 Analizando {len(symbols)} monedas Spot... {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     candidate_signals = []
-    now = time.time()
 
     for symbol in symbols:
-        try:
-            df = get_klines(symbol)
-            if df is None or len(df) < 50:
+        df = get_klines(symbol)
+        if df is None or len(df) < 50:
+            continue
+
+        df = calculate_indicators(df)
+        last_row = df.iloc[-1]
+
+        close_price = last_row['close']
+        rsi = last_row['RSI']
+        ema50 = last_row['EMA50']
+        ema200 = last_row['EMA200']
+
+        # Log de depuración
+        print(f"{symbol} → Precio: {close_price:.4f}, RSI: {rsi:.2f}, EMA50: {ema50:.2f}, EMA200: {ema200:.2f}")
+
+        signal = None
+        if rsi < 30 and ema50 > ema200:
+            signal = "LONG"
+        elif rsi > 70 and ema50 < ema200:
+            signal = "SHORT"
+
+        if signal:
+            # Evita repetir señal reciente
+            last_signal_time = last_signals.get(symbol)
+            if last_signal_time and (datetime.datetime.now() - last_signal_time).seconds < 3600:
                 continue
 
-            # Filtrar por volumen
-            vol_24h = df['volume'].sum()
-            if vol_24h < 1_000_000:
-                continue
+            tp = round(close_price * (1.02 if signal == "LONG" else 0.98), 6)
+            sl = round(close_price * (0.98 if signal == "LONG" else 1.02), 6)
+            candidate_signals.append((symbol, signal, close_price, tp, sl))
 
-            # Indicadores
-            df['rsi'] = rsi(df['close'])
-            df['ema50'] = ema(df['close'], 50)
-            df['ema200'] = ema(df['close'], 200)
-            df['atr'] = atr(df)
+    # Enviar señales
+    if candidate_signals:
+        for sym, sig, price, tp, sl in candidate_signals:
+            msg = (
+                f"🔔 Señal Detectada\n"
+                f"Moneda: {sym}\n"
+                f"Tipo: {sig}\n"
+                f"Entrada: {price}\n"
+                f"TP: {tp}\n"
+                f"SL: {sl}\n"
+                f"Apalancamiento sugerido: x10\n"
+            )
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+            last_signals[sym] = datetime.datetime.now()
+            print(f"📤 Señal enviada: {sym} {sig}")
+    else:
+        print("⚠️ No se detectaron señales en este ciclo")
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚠️ No se detectaron señales en este ciclo")
 
-            last = df.iloc[-1]
-            rsi_val = last['rsi']
-            ema50 = last['ema50']
-            ema200 = last['ema200']
-            atr_val = last['atr']
-            price = last['close']
-
-            signal = None
-            score = 0
-
-            # Estrategia filtrada por tendencia
-            if rsi_val < 30 and ema50 > ema200:
-                signal = "LONG"
-                score = 70 - rsi_val  # cuanto más sobrevendido, más score
-            elif rsi_val > 70 and ema50 < ema200:
-                signal = "SHORT"
-                score = rsi_val - 30  # cuanto más sobrecomprado, más score
-
-            if signal:
-                # Evitar repetir señal reciente
-                key = f"{symbol}_{signal}"
-                if key in last_signals and now - last_signals[key] < 3600:
-                    continue
-
-                tp = price + (2 * atr_val if signal == "LONG" else -2 * atr_val)
-                sl = price - (2 * atr_val if signal == "LONG" else -2 * atr_val)
-                candidate_signals.append((score, symbol, signal, price, tp, sl, rsi_val))
-
-        except Exception as e:
-            print(f"⚠️ Error analizando {symbol}: {e}")
-
-    # --- Filtrar top 3 señales ---
-    candidate_signals.sort(reverse=True, key=lambda x: x[0])
-    top_signals = candidate_signals[:3]
-
-    for score, symbol, signal, price, tp, sl, rsi_val in top_signals:
-        news = check_news(symbol)
-        msg = (
-            f"🔔 Señal Detectada\n"
-            f"Moneda: {symbol}\n"
-            f"Tipo: {signal}\n"
-            f"Entrada: {price:.4f}\n"
-            f"TP: {tp:.4f}\n"
-            f"SL: {sl:.4f}\n"
-            f"RSI: {rsi_val:.2f}\n"
-        )
-        if news:
-            msg += f"{news}\n"
-
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-        print(f"📤 Señal enviada: {symbol} {signal}")
-
-        last_signals[f"{symbol}_{signal}"] = time.time()
-
-        with open(CSV_FILE, mode='a', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                datetime.datetime.now(), symbol, signal, price, tp, sl, rsi_val, news if news else ""
-            ])
-
-# --- Heartbeat cada 1 hora ---
-def heartbeat():
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ Bot activo - {now}")
-
-# --- Scheduler ---
+# ============================
+# 🔹 Scheduler
+# ============================
 schedule.every(15).minutes.do(analyze_market)
-schedule.every().hour.do(heartbeat)
 
-# --- Aviso inicial ---
 bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot Spot Binance iniciado correctamente...")
+print("✅ Bot Spot Binance iniciado. Analiza cada 15 minutos...")
 
-print("✅ Bot Spot iniciado. Analiza cada 15 minutos y heartbeat cada 1 hora...")
 while True:
     schedule.run_pending()
     time.sleep(1)
