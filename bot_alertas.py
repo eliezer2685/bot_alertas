@@ -1,25 +1,15 @@
-import os, time, datetime, requests, ccxt, pandas as pd, ta, feedparser, csv
+import os, time, datetime, requests, pandas as pd, ta, feedparser, csv
 from textblob import TextBlob
 from telegram import Bot
 import schedule
 
-# 🔹 Variables de entorno
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
+# 🔹 Variables de entorno (solo Telegram)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 
-if not all([API_KEY, API_SECRET, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
-    print("❌ ERROR: Variables de entorno no configuradas.")
+if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
+    print("❌ ERROR: Variables de entorno de Telegram no configuradas.")
     exit()
-
-# 🔹 Conexión a Binance Futures
-binance = ccxt.binance({
-    'apiKey': API_KEY,
-    'secret': API_SECRET,
-    'enableRateLimit': True,
-    'options': {'defaultType': 'future'}
-})
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
@@ -46,10 +36,10 @@ news_feeds = [
 
 # 🔹 Analiza noticias y devuelve sentimiento
 def check_news(symbol):
-    keyword = symbol.split("/")[0]
+    keyword = symbol.replace("USDT", "")
     for feed in news_feeds:
         d = feedparser.parse(feed)
-        for entry in d.entries[:5]:  # últimas 5 noticias
+        for entry in d.entries[:5]:
             title = entry.title
             if keyword.lower() in title.lower():
                 sentiment = TextBlob(title).sentiment.polarity
@@ -59,10 +49,23 @@ def check_news(symbol):
                     return f"🔴 Noticia negativa: \"{title}\""
     return None
 
-# 🔹 Obtiene todas las monedas de futuros USDT-M
+# 🔹 Obtener lista de símbolos de futuros sin API Key
 def get_futures_symbols():
-    markets = binance.load_markets()
-    return [s for s in markets if s.endswith("/USDT") and markets[s]['type'] == 'future']
+    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
+    data = requests.get(url).json()
+    symbols = [s['symbol'] for s in data['symbols'] if s['quoteAsset'] == 'USDT']
+    return symbols
+
+# 🔹 Obtener OHLCV público sin API Key
+def fetch_ohlcv(symbol, interval='15m', limit=200):
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
+    data = requests.get(url).json()
+    ohlcv = []
+    for k in data:
+        ohlcv.append([
+            k[0], float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])
+        ])
+    return pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
 
 # 🔹 Analiza el mercado
 def analyze_market():
@@ -71,11 +74,7 @@ def analyze_market():
 
     for symbol in symbols:
         try:
-            ohlcv = binance.fetch_ohlcv(symbol, '15m', limit=200)
-            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
-            df['close'] = df['close'].astype(float)
-
-            # Indicadores técnicos
+            df = fetch_ohlcv(symbol, '15m', 200)
             df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
             macd = ta.trend.MACD(df['close'])
             df['macd'] = macd.macd()
@@ -97,7 +96,6 @@ def analyze_market():
                 tp = round(price * (1.02 if signal == "LONG" else 0.98), 6)
                 sl = round(price * (0.98 if signal == "LONG" else 1.02), 6)
 
-                # Revisar noticias
                 news = check_news(symbol)
                 msg = (
                     f"🔔 Señal Detectada\n"
@@ -111,11 +109,9 @@ def analyze_market():
                 if news:
                     msg += f"{news}\n"
 
-                # Enviar Telegram
                 bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
                 print(f"📤 Señal enviada: {symbol} {signal}")
 
-                # Guardar histórico
                 with open(CSV_FILE, mode='a', newline='') as f:
                     writer = csv.writer(f)
                     writer.writerow([datetime.datetime.now(), symbol, signal, price, tp, sl, news if news else ""])
@@ -129,11 +125,10 @@ def heartbeat():
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ Bot activo - {now}")
 
 # 🔹 Scheduler
-schedule.every(15).minutes.do(analyze_market)  # ⬅️ cada 15 minutos
+schedule.every(15).minutes.do(analyze_market)
 schedule.every().hour.do(heartbeat)
 
-# 🔹 Aviso inicial
-bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot de alertas iniciado correctamente y en ejecución...")
+bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot de alertas iniciado correctamente sin API Key...")
 
 print("✅ Bot iniciado. Analiza cada 15 minutos y heartbeat cada 1 hora...")
 while True:
