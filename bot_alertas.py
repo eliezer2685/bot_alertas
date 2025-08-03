@@ -44,27 +44,27 @@ news_feeds = [
     "https://beincrypto.com/feed/"
 ]
 
-# 🔹 Función para analizar sentimiento de noticias
+# 🔹 Analiza noticias y devuelve sentimiento
 def check_news(symbol):
     keyword = symbol.split("/")[0]
     for feed in news_feeds:
         d = feedparser.parse(feed)
-        for entry in d.entries[:5]:  # Solo 5 últimas noticias por feed
+        for entry in d.entries[:5]:  # últimas 5 noticias
             title = entry.title
             if keyword.lower() in title.lower():
                 sentiment = TextBlob(title).sentiment.polarity
                 if sentiment > 0.1:
-                    return f"Noticia positiva: \"{title}\""
+                    return f"🟢 Noticia positiva: \"{title}\""
                 elif sentiment < -0.1:
-                    return f"Noticia negativa: \"{title}\""
+                    return f"🔴 Noticia negativa: \"{title}\""
     return None
 
-# 🔹 Función para obtener todas las monedas de futuros
+# 🔹 Obtiene todas las monedas de futuros USDT-M
 def get_futures_symbols():
     markets = binance.load_markets()
     return [s for s in markets if s.endswith("/USDT") and markets[s]['type'] == 'future']
 
-# 🔹 Función principal de análisis
+# 🔹 Analiza el mercado
 def analyze_market():
     symbols = get_futures_symbols()
     print(f"🔍 Analizando {len(symbols)} monedas de futuros...")
@@ -123,10 +123,19 @@ def analyze_market():
         except Exception as e:
             print(f"⚠️ Error analizando {symbol}: {e}")
 
-# 🔹 Scheduler cada 5 minutos
-schedule.every(5).minutes.do(analyze_market)
+# 🔹 Heartbeat (cada 1 hora)
+def heartbeat():
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ Bot activo - {now}")
 
-print("✅ Bot de alertas iniciado (todas las monedas de futuros). Analizando cada 5 minutos...")
+# 🔹 Scheduler
+schedule.every(5).minutes.do(analyze_market)
+schedule.every().hour.do(heartbeat)
+
+# 🔹 Aviso inicial
+bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot de alertas iniciado correctamente y en ejecución...")
+
+print("✅ Bot iniciado. Analiza cada 5 minutos y heartbeat cada 1 hora...")
 while True:
     schedule.run_pending()
     time.sleep(1)
