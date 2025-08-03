@@ -11,3 +11,4 @@ schedule
 textblob==0.17.1
 beautifulsoup4==4.12.3
 lxml==5.2.2
+python-binance==1.0.19
