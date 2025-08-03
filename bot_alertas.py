@@ -1,15 +1,10 @@
-import os
-import time
-import datetime
-import pandas as pd
-import numpy as np
-import requests
-import schedule
+import os, time, datetime, requests, pandas as pd, ta, feedparser, csv
+from textblob import TextBlob
 from telegram import Bot
+import schedule
+import ccxt
 
-# ============================
-# 🔹 Configuración de Telegram
-# ============================
+# 🔹 Variables de entorno
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 
@@ -19,120 +14,126 @@ if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# ============================
-# 🔹 Lista de 50 monedas Spot
-# ============================
+# 🔹 CSV para histórico
+CSV_FILE = "historico_senales.csv"
+if not os.path.exists(CSV_FILE):
+    with open(CSV_FILE, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Fecha", "Moneda", "Señal", "Precio Entrada", "TP", "SL", "Noticia"])
+
+# 🔹 Lista de 50 monedas spot en Binance
 symbols = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","SOLUSDT","DOGEUSDT","ADAUSDT","TRXUSDT","MATICUSDT","LTCUSDT",
-    "DOTUSDT","SHIBUSDT","AVAXUSDT","UNIUSDT","ATOMUSDT","LINKUSDT","XLMUSDT","FILUSDT","ICPUSDT","APTUSDT",
-    "ARBUSDT","SANDUSDT","MANAUSDT","APEUSDT","AXSUSDT","NEARUSDT","EOSUSDT","FLOWUSDT","XTZUSDT","THETAUSDT",
-    "AAVEUSDT","GRTUSDT","RUNEUSDT","KAVAUSDT","CRVUSDT","FTMUSDT","CHZUSDT","SNXUSDT","LDOUSDT","OPUSDT",
-    "COMPUSDT","DYDXUSDT","BLURUSDT","RNDRUSDT","GMTUSDT","1INCHUSDT","OCEANUSDT","SUIUSDT","PYTHUSDT","JTOUSDT"
+    "BTC/USDT","ETH/USDT","BNB/USDT","XRP/USDT","SOL/USDT","DOGE/USDT","ADA/USDT","TRX/USDT","MATIC/USDT","LTC/USDT",
+    "DOT/USDT","SHIB/USDT","AVAX/USDT","UNI/USDT","ATOM/USDT","LINK/USDT","XLM/USDT","FIL/USDT","ICP/USDT","APT/USDT",
+    "ARB/USDT","SAND/USDT","MANA/USDT","APE/USDT","AXS/USDT","NEAR/USDT","EOS/USDT","FLOW/USDT","XTZ/USDT","THETA/USDT",
+    "AAVE/USDT","GRT/USDT","RUNE/USDT","KAVA/USDT","CRV/USDT","FTM/USDT","CHZ/USDT","SNX/USDT","LDO/USDT","OP/USDT",
+    "COMP/USDT","DYDX/USDT","BLUR/USDT","RNDR/USDT","GMT/USDT","1INCH/USDT","OCEAN/USDT","SUI/USDT","PYTH/USDT","JTO/USDT"
 ]
 
-# ============================
-# 🔹 Obtener velas de Binance
-# ============================
-def get_klines(symbol, interval="15m", limit=200):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    try:
-        data = requests.get(url, timeout=10).json()
-        if isinstance(data, dict) and "code" in data:
-            print(f"⚠️ Error Binance: {data}")
-            return None
-        df = pd.DataFrame(data, columns=[
-            'time','open','high','low','close','volume','close_time','qav','num_trades','taker_base','taker_quote','ignore'
-        ])
-        df['time'] = pd.to_datetime(df['time'], unit='ms')
-        df['close'] = df['close'].astype(float)
-        df['volume'] = df['volume'].astype(float)
-        return df[['time','close','volume']]
-    except Exception as e:
-        print(f"⚠️ Error obteniendo velas para {symbol}: {e}")
-        return None
+# 🔹 RSS de noticias sobre criptos
+news_feeds = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://news.bitcoin.com/feed/",
+    "https://cryptoslate.com/feed/",
+    "https://decrypt.co/feed",
+    "https://bitcoinmagazine.com/feed",
+    "https://u.today/rss",
+    "https://ambcrypto.com/feed/",
+    "https://cryptopotato.com/feed/",
+    "https://beincrypto.com/feed/"
+]
 
-# ============================
-# 🔹 Indicadores Técnicos
-# ============================
-def calculate_indicators(df):
-    df['EMA50'] = df['close'].ewm(span=50).mean()
-    df['EMA200'] = df['close'].ewm(span=200).mean()
+# 🔹 Conexión a Binance Spot (sin API Key)
+binance = ccxt.binance()
 
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+# 🔹 Analiza noticias y devuelve sentimiento
+def check_news(symbol):
+    keyword = symbol.replace("/USDT", "")
+    for feed in news_feeds:
+        d = feedparser.parse(feed)
+        for entry in d.entries[:5]:
+            title = entry.title
+            if keyword.lower() in title.lower():
+                sentiment = TextBlob(title).sentiment.polarity
+                if sentiment > 0.1:
+                    return f"🟢 Noticia positiva: \"{title}\""
+                elif sentiment < -0.1:
+                    return f"🔴 Noticia negativa: \"{title}\""
+    return None
 
-    return df
-
-# ============================
-# 🔹 Analizar mercado
-# ============================
-last_signals = {}
-
+# 🔹 Estrategia técnica usando datos de Binance Spot
 def analyze_market():
-    print(f"\n🔍 Analizando {len(symbols)} monedas Spot... {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    candidate_signals = []
-
+    print(f"🔍 Analizando {len(symbols)} monedas... {datetime.datetime.now()}", flush=True)
     for symbol in symbols:
-        df = get_klines(symbol)
-        if df is None or len(df) < 50:
-            continue
+        try:
+            ohlcv = binance.fetch_ohlcv(symbol, timeframe='15m', limit=50)
+            df = pd.DataFrame(ohlcv, columns=['timestamp','open','high','low','close','volume'])
+            df['rsi'] = ta.momentum.rsi(df['close'], window=14)
+            df['ema50'] = ta.trend.ema_indicator(df['close'], window=50)
+            df['ema200'] = ta.trend.ema_indicator(df['close'], window=200)
+            df['macd'] = ta.trend.macd(df['close'])
+            df['macd_signal'] = ta.trend.macd_signal(df['close'])
 
-        df = calculate_indicators(df)
-        last_row = df.iloc[-1]
+            close_price = df['close'].iloc[-1]
+            rsi = df['rsi'].iloc[-1]
+            macd = df['macd'].iloc[-1]
+            macd_signal = df['macd_signal'].iloc[-1]
+            ema50 = df['ema50'].iloc[-1]
+            ema200 = df['ema200'].iloc[-1]
 
-        close_price = last_row['close']
-        rsi = last_row['RSI']
-        ema50 = last_row['EMA50']
-        ema200 = last_row['EMA200']
+            # 🔹 Log de precios en Render
+            print(f"{symbol}: precio={close_price:.4f}, RSI={rsi:.2f}", flush=True)
 
-        # Log de depuración
-        print(f"{symbol} → Precio: {close_price:.4f}, RSI: {rsi:.2f}, EMA50: {ema50:.2f}, EMA200: {ema200:.2f}")
+            # 🔹 Generar señal simple
+            signal = None
+            if rsi < 30 and macd > macd_signal and ema50 > ema200:
+                signal = "LONG"
+            elif rsi > 70 and macd < macd_signal and ema50 < ema200:
+                signal = "SHORT"
 
-        signal = None
-        if rsi < 30 and ema50 > ema200:
-            signal = "LONG"
-        elif rsi > 70 and ema50 < ema200:
-            signal = "SHORT"
+            if signal:
+                tp = round(close_price * (1.02 if signal == "LONG" else 0.98), 6)
+                sl = round(close_price * (0.98 if signal == "LONG" else 1.02), 6)
 
-        if signal:
-            # Evita repetir señal reciente
-            last_signal_time = last_signals.get(symbol)
-            if last_signal_time and (datetime.datetime.now() - last_signal_time).seconds < 3600:
-                continue
+                news = check_news(symbol)
+                msg = (
+                    f"🔔 Señal Detectada\n"
+                    f"Moneda: {symbol}\n"
+                    f"Tipo: {signal}\n"
+                    f"Entrada: {close_price}\n"
+                    f"TP: {tp}\n"
+                    f"SL: {sl}\n"
+                    f"Apalancamiento sugerido: x10\n"
+                )
+                if news:
+                    msg += f"{news}\n"
 
-            tp = round(close_price * (1.02 if signal == "LONG" else 0.98), 6)
-            sl = round(close_price * (0.98 if signal == "LONG" else 1.02), 6)
-            candidate_signals.append((symbol, signal, close_price, tp, sl))
+                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+                print(f"📤 Señal enviada: {symbol} {signal}", flush=True)
 
-    # Enviar señales
-    if candidate_signals:
-        for sym, sig, price, tp, sl in candidate_signals:
-            msg = (
-                f"🔔 Señal Detectada\n"
-                f"Moneda: {sym}\n"
-                f"Tipo: {sig}\n"
-                f"Entrada: {price}\n"
-                f"TP: {tp}\n"
-                f"SL: {sl}\n"
-                f"Apalancamiento sugerido: x10\n"
-            )
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-            last_signals[sym] = datetime.datetime.now()
-            print(f"📤 Señal enviada: {sym} {sig}")
-    else:
-        print("⚠️ No se detectaron señales en este ciclo")
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="⚠️ No se detectaron señales en este ciclo")
+                with open(CSV_FILE, mode='a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([datetime.datetime.now(), symbol, signal, close_price, tp, sl, news if news else ""])
 
-# ============================
+        except Exception as e:
+            print(f"⚠️ Error analizando {symbol}: {e}", flush=True)
+
+# 🔹 Heartbeat cada 1 hora
+def heartbeat():
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ Bot activo - {now}")
+
 # 🔹 Scheduler
-# ============================
 schedule.every(15).minutes.do(analyze_market)
+schedule.every().hour.do(heartbeat)
 
-bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot Spot Binance iniciado correctamente...")
-print("✅ Bot Spot Binance iniciado. Analiza cada 15 minutos...")
+# 🔹 Aviso inicial
+bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot de alertas Binance Spot iniciado correctamente...")
+print("✅ Bot iniciado. Analiza cada 15 minutos y heartbeat cada 1 hora...", flush=True)
+
+# 🔹 Primer análisis inmediato
+analyze_market()
 
 while True:
     schedule.run_pending()
