@@ -1,206 +1,203 @@
 import os
 import time
+import requests
 import pandas as pd
 import numpy as np
-import requests
 import schedule
-import datetime
+from datetime import datetime, timedelta
 from binance.client import Client
-from binance.enums import *
-from telegram import Bot
+from binance.exceptions import BinanceAPIException
 from textblob import TextBlob
+from telegram import Bot
 
-# ==============================
-# CONFIGURACIONES
-# ==============================
-
+# ======================
+# CONFIGURACIÓN
+# ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
-
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 bot = Bot(token=TELEGRAM_TOKEN)
-client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
-# Apalancamiento y riesgo
-LEVERAGE = 5
-POSITION_SIZE_PERCENT = 0.3  # 30% dinámico
+COOLDOWN_ALERTA = 3  # horas sin repetir alerta por moneda
+UMBRAL_ALERTA = 70  # probabilidad mínima
+MAX_ALERTAS_HORA = 10
 
-# Timeframe y configuración de velas
-TIMEFRAME = '15m'
-LIMIT_CANDLES = 500  # más velas para indicadores robustos
+# ======================
+# INICIALIZACIÓN BINANCE (SPOT)
+# ======================
+client = Client()  # sin API key para spot público
 
-# Lista inicial de pares de futuros USDT
-SYMBOLS = [
-    'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','DOGEUSDT','MATICUSDT','DOTUSDT','LTCUSDT',
-    'AVAXUSDT','TRXUSDT','UNIUSDT','LINKUSDT','ATOMUSDT','FILUSDT','ETCUSDT','ICPUSDT','APTUSDT','NEARUSDT',
-    'ARBUSDT','OPUSDT','SUIUSDT','RNDRUSDT','LDOUSDT','STXUSDT','IMXUSDT','INJUSDT','WOOUSDT','FLOWUSDT',
-    'KAVAUSDT','GALAUSDT','GMTUSDT','OCEANUSDT','1INCHUSDT','PYTHUSDT','JTOUSDT','APEUSDT','BLURUSDT','MINAUSDT',
-    'FTMUSDT','DYDXUSDT','RUNEUSDT','XLMUSDT','C98USDT','WAVESUSDT','ROSEUSDT','CHZUSDT','ENJUSDT','BANDUSDT','SANDUSDT'
+# Lista de monedas a analizar
+MONEDAS = [
+    'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'ADAUSDT',
+    'DOGEUSDT', 'MATICUSDT', 'DOTUSDT', 'LTCUSDT', 'TRXUSDT', 'LINKUSDT',
+    'AVAXUSDT', 'ATOMUSDT', 'XMRUSDT', 'ALGOUSDT', 'ICPUSDT', 'FILUSDT',
+    'SANDUSDT', 'AXSUSDT', 'THETAUSDT', 'EGLDUSDT', 'VETUSDT', 'FTMUSDT',
+    'GALAUSDT', 'APEUSDT', 'NEARUSDT', 'FLOWUSDT', 'CHZUSDT', 'HBARUSDT',
+    'QNTUSDT', 'CRVUSDT', 'RUNEUSDT', 'MANAUSDT', '1INCHUSDT', 'AAVEUSDT',
+    'KAVAUSDT', 'GMXUSDT', 'RNDRUSDT', 'BLURUSDT', 'SUIUSDT', 'PYTHUSDT',
+    'JTOUSDT', 'OCEANUSDT', 'ARUSDT', 'OPUSDT', 'LDOUSDT', 'INJUSDT',
+    'DYDXUSDT', 'COMPUSDT', 'PEPEUSDT', 'BONKUSDT', 'SEIUSDT', 'TIAUSDT',
+    'WIFUSDT', 'TURBOUSDT', 'FLOKIUSDT', 'SHIBUSDT', 'UNIUSDT', 'ENSUSDT'
 ]
 
-# Evitar alertas duplicadas por 3 horas
-last_alert = {}
+# Almacena último timestamp de alerta para cooldown
+ultimo_alerta = {m: datetime.min for m in MONEDAS}
 
-# ==============================
-# FUNCIONES AUXILIARES
-# ==============================
-
-def send_telegram(msg: str):
-    try:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-    except Exception as e:
-        print("Error enviando Telegram:", e)
-
-def get_klines(symbol):
-    try:
-        data = client.futures_klines(symbol=symbol, interval=TIMEFRAME, limit=LIMIT_CANDLES)
-        df = pd.DataFrame(data, columns=[
-            'time','o','h','l','c','v','ct','qv','n','tbb','tbq','ig'
-        ])
-        df['c'] = df['c'].astype(float)
-        df['h'] = df['h'].astype(float)
-        df['l'] = df['l'].astype(float)
-        df['v'] = df['v'].astype(float)
-        return df
-    except Exception as e:
-        print(f"Error obteniendo velas {symbol}: {e}")
-        return None
-
-def calculate_indicators(df):
-    # RSI
-    delta = df['c'].diff()
-    gain = delta.where(delta>0,0)
-    loss = -delta.where(delta<0,0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-    rs = avg_gain / avg_loss
-    df['RSI'] = 100 - (100/(1+rs))
-
-    # EMA
-    df['EMA50'] = df['c'].ewm(span=50).mean()
-    df['EMA200'] = df['c'].ewm(span=200).mean()
-
-    # MACD
-    ema12 = df['c'].ewm(span=12).mean()
-    ema26 = df['c'].ewm(span=26).mean()
-    df['MACD'] = ema12 - ema26
-    df['Signal'] = df['MACD'].ewm(span=9).mean()
-
-    # Volumen estrategia simple
-    df['Vol_Avg'] = df['v'].rolling(20).mean()
-
+# ======================
+# FUNCIONES DE INDICADORES
+# ======================
+def obtener_velas(symbol, interval='15m', limit=200):
+    klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+    df = pd.DataFrame(klines, columns=[
+        'timestamp','open','high','low','close','volume',
+        'close_time','qav','trades','tbbav','tbqav','ignore'
+    ])
+    df['close'] = df['close'].astype(float)
+    df['volume'] = df['volume'].astype(float)
     return df
 
-def get_news_sentiment():
+def calcular_indicadores(df):
+    df['ema9'] = df['close'].ewm(span=9).mean()
+    df['ema21'] = df['close'].ewm(span=21).mean()
+    df['ema50'] = df['close'].ewm(span=50).mean()
+
+    df['rsi'] = calcular_rsi(df['close'], 14)
+    df['macd'], df['macd_signal'] = calcular_macd(df['close'])
+    return df
+
+def calcular_rsi(series, period=14):
+    delta = series.diff()
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    avg_gain = pd.Series(gain).rolling(period).mean()
+    avg_loss = pd.Series(loss).rolling(period).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+def calcular_macd(series, short=12, long=26, signal=9):
+    ema_short = series.ewm(span=short).mean()
+    ema_long = series.ewm(span=long).mean()
+    macd = ema_short - ema_long
+    signal_line = macd.ewm(span=signal).mean()
+    return macd, signal_line
+
+# ======================
+# ESTRATEGIAS
+# ======================
+def estrategia_ema_macd_rsi(df):
+    c = df.iloc[-1]
+    if c['ema9'] > c['ema21'] > c['ema50'] and c['macd'] > c['macd_signal'] and c['rsi'] > 50:
+        return 'LONG', 70
+    elif c['ema9'] < c['ema21'] < c['ema50'] and c['macd'] < c['macd_signal'] and c['rsi'] < 50:
+        return 'SHORT', 70
+    return None, 0
+
+def estrategia_volumen(df):
+    c = df.iloc[-1]
+    vol_medio = df['volume'].iloc[-20:].mean()
+    if c['volume'] > vol_medio*2:
+        return 'BREAKOUT', 60
+    return None, 0
+
+def estrategia_breakout(df):
+    c = df.iloc[-1]
+    if c['close'] > df['close'].max() * 0.995:
+        return 'LONG', 65
+    if c['close'] < df['close'].min() * 1.005:
+        return 'SHORT', 65
+    return None, 0
+
+def estrategia_noticias(symbol):
+    # Noticias mock (a integrar con API real tipo CryptoPanic o NewsAPI)
     try:
-        url = "https://news.google.com/rss/search?q=crypto+OR+bitcoin&hl=en-US&gl=US&ceid=US:en"
-        import feedparser
-        feed = feedparser.parse(url)
-        top_titles = [entry.title for entry in feed.entries[:5]]
-        sentiment_scores = [TextBlob(t).sentiment.polarity for t in top_titles]
-        avg_sentiment = np.mean(sentiment_scores) if sentiment_scores else 0
-        return avg_sentiment, top_titles
+        url = f"https://cryptopanic.com/api/v1/posts/?auth_token={os.getenv('CRYPTO_TOKEN')}&currencies={symbol[:-4].lower()}"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            news = resp.json().get('results', [])
+            score = 0
+            for n in news[:5]:
+                polarity = TextBlob(n['title']).sentiment.polarity
+                score += polarity
+            if score > 0.5: return 15
+            if score < -0.5: return 15
     except:
-        return 0, []
+        pass
+    return 0
 
-def strategy_analysis(df):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+# ======================
+# ENVÍO DE ALERTAS
+# ======================
+def enviar_alerta(symbol, direccion, prob, precio):
+    tp = round(precio * 1.02, 4)
+    sl = round(precio * 0.98, 4)
+    msg = (f"🚨 Alerta {direccion} {symbol}\n"
+           f"Probabilidad: {prob}%\n"
+           f"Precio: {precio}\n"
+           f"TP: {tp} | SL: {sl}\n"
+           f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
 
-    long_signals = 0
-    short_signals = 0
+# ======================
+# LOOP PRINCIPAL
+# ======================
+def analizar_moneda(symbol):
+    global ultimo_alerta
 
-    # Estrategia 1: RSI + EMA + MACD
-    if last['RSI']<30 and last['EMA50']>last['EMA200'] and last['MACD']>last['Signal']:
-        long_signals+=1
-    if last['RSI']>70 and last['EMA50']<last['EMA200'] and last['MACD']<last['Signal']:
-        short_signals+=1
+    df = obtener_velas(symbol)
+    df = calcular_indicadores(df)
+    precio_actual = df['close'].iloc[-1]
 
-    # Estrategia 2: Volumen
-    if last['v']>last['Vol_Avg']*2:
-        if last['c']>prev['c']: long_signals+=1
-        else: short_signals+=1
+    dir1, p1 = estrategia_ema_macd_rsi(df)
+    dir2, p2 = estrategia_volumen(df)
+    dir3, p3 = estrategia_breakout(df)
+    p4 = estrategia_noticias(symbol)
 
-    # Estrategia 3: Cruce EMA50/200
-    if prev['EMA50']<prev['EMA200'] and last['EMA50']>last['EMA200']:
-        long_signals+=1
-    if prev['EMA50']>prev['EMA200'] and last['EMA50']<last['EMA200']:
-        short_signals+=1
+    # Combinar probabilidades
+    direcciones = [d for d in [dir1, dir2, dir3] if d]
+    if not direcciones:
+        return None
 
-    # Estrategia 4: MACD cruce
-    if prev['MACD']<prev['Signal'] and last['MACD']>last['Signal']:
-        long_signals+=1
-    if prev['MACD']>prev['Signal'] and last['MACD']<last['Signal']:
-        short_signals+=1
+    probabilidad = p1 + p2 + p3 + p4
+    probabilidad = min(probabilidad, 100)
+    direccion_final = direcciones[0]  # prioridad a la primera que detecta tendencia
 
-    prob_long = long_signals/4*100
-    prob_short = short_signals/4*100
+    # Filtro por probabilidad y cooldown
+    if probabilidad >= UMBRAL_ALERTA:
+        if datetime.now() - ultimo_alerta[symbol] > timedelta(hours=COOLDOWN_ALERTA):
+            ultimo_alerta[symbol] = datetime.now()
+            return (symbol, direccion_final, probabilidad, precio_actual)
+    return None
 
-    return prob_long, prob_short, last['c']
+def enviar_resumen():
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID,
+                     text=f"✅ Bot activo {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.\nMonedas analizadas: {len(MONEDAS)}")
 
-def check_balance_and_open(symbol, side, price):
-    try:
-        balance = float(client.futures_account_balance()[1]['balance'])
-        qty = round((balance*POSITION_SIZE_PERCENT*LEVERAGE)/price, 3)
+def ciclo_completo():
+    alertas = []
+    for symbol in MONEDAS:
+        try:
+            alerta = analizar_moneda(symbol)
+            if alerta:
+                alertas.append(alerta)
+        except Exception as e:
+            print(f"Error {symbol}: {e}")
 
-        if qty<=0:
-            send_telegram(f"Saldo insuficiente para abrir {side} en {symbol}")
-            return False
+    # Ordenar por mayor probabilidad y limitar
+    alertas.sort(key=lambda x: x[2], reverse=True)
+    alertas = alertas[:MAX_ALERTAS_HORA]
 
-        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
-        client.futures_create_order(
-            symbol=symbol,
-            side=SIDE_BUY if side=="LONG" else SIDE_SELL,
-            type=FUTURE_ORDER_TYPE_MARKET,
-            quantity=qty
-        )
-        send_telegram(f"✅ Posición {side} abierta en {symbol} ({qty} contratos) @ {price}")
-        return True
-    except Exception as e:
-        send_telegram(f"❌ Error abriendo {side} en {symbol}: {e}")
-        return False
+    for a in alertas:
+        enviar_alerta(*a)
 
-def analyze_market():
-    global last_alert
-    sentiment, news = get_news_sentiment()
-    for symbol in SYMBOLS:
-        df = get_klines(symbol)
-        if df is None: continue
-        df = calculate_indicators(df)
-        prob_long, prob_short, price = strategy_analysis(df)
+# ======================
+# SCHEDULER
+# ======================
+schedule.every(30).minutes.do(ciclo_completo)
+schedule.every().hour.do(enviar_resumen)
 
-        now = datetime.datetime.now()
-        if prob_long>=90 or prob_short>=90:
-            last_time = last_alert.get(symbol, None)
-            if not last_time or (now-last_time).total_seconds()>10800:  # 3h
-                side = "LONG" if prob_long>prob_short else "SHORT"
-                opened = check_balance_and_open(symbol, side, price)
-                send_telegram(
-                    f"🚨 ALERTA {side} {symbol}\n"
-                    f"Precio: {price}\n"
-                    f"Confianza: {max(prob_long,prob_short):.2f}%\n"
-                    f"Sentimiento noticias: {sentiment:.2f}\n"
-                    f"Top news: {news[:2]}"
-                )
-                last_alert[symbol] = now
-
-def hourly_summary():
-    sentiment, news = get_news_sentiment()
-    balance = client.futures_account_balance()
-    send_telegram(f"📊 Resumen:\n"
-                  f"Balance: {balance[1]['balance']} USDT\n"
-                  f"Sentimiento: {sentiment:.2f}\n"
-                  f"Noticias: {news[:3]}")
-
-# ==============================
-# INICIO DEL BOT
-# ==============================
-send_telegram("🤖 Bot de Trading iniciado correctamente.")
-schedule.every(30).minutes.do(analyze_market)
-schedule.every(1).hours.do(hourly_summary)
+bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🤖 Bot de alertas iniciado correctamente.")
 
 while True:
     schedule.run_pending()
-    time.sleep(5)
+    time.sleep(1)
