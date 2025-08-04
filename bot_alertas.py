@@ -3,233 +3,204 @@ import time
 import pandas as pd
 import numpy as np
 import requests
-import feedparser
 import schedule
-from datetime import datetime, timedelta
-from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator, MACD
+import datetime
 from binance.client import Client
 from binance.enums import *
 from telegram import Bot
+from textblob import TextBlob
 
-# ================== CONFIG ==================
-API_KEY = os.getenv("BINANCE_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET")
+# ==============================
+# CONFIGURACIONES
+# ==============================
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 
-client = Client(API_KEY, API_SECRET)
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
+
 bot = Bot(token=TELEGRAM_TOKEN)
+client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
-INTERVAL = '15m'
-LIMIT = 120  # velas (30 horas)
+# Apalancamiento y riesgo
 LEVERAGE = 5
-POSITION_SIZE_PCT = 0.30
-DUPLICATE_BLOCK_HOURS = 3
-NEWS_FEED = "https://cryptopanic.com/rss/"
+POSITION_SIZE_PERCENT = 0.3  # 30% dinámico
 
-# Trailing
-TRAILING_START = 0.01  # 1% profit para activar trailing
-TRAILING_STEP = 0.003  # 0.3% de distancia
+# Timeframe y configuración de velas
+TIMEFRAME = '15m'
+LIMIT_CANDLES = 500  # más velas para indicadores robustos
 
-# Monedas a analizar (futuros top 60)
+# Lista inicial de pares de futuros USDT
 SYMBOLS = [
-    'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'SOLUSDT', 'DOTUSDT', 'LTCUSDT', 'MATICUSDT',
-    'AVAXUSDT', 'SHIBUSDT', 'TRXUSDT', 'UNIUSDT', 'XLMUSDT', 'ATOMUSDT', 'ICPUSDT', 'FILUSDT', 'SANDUSDT', 'EGLDUSDT',
-    'APEUSDT', 'GALAUSDT', 'AAVEUSDT', 'EOSUSDT', 'FLOWUSDT', 'KSMUSDT', 'AXSUSDT', 'NEARUSDT', 'CHZUSDT', 'THETAUSDT',
-    'RUNEUSDT', 'GMTUSDT', 'SNXUSDT', 'CRVUSDT', 'ENJUSDT', 'DYDXUSDT', 'RNDRUSDT', 'OCEANUSDT', 'SUIUSDT', 'JTOUSDT',
-    'PYTHUSDT', 'ARUSDT', 'STXUSDT', 'INJUSDT', 'CFXUSDT', 'OPUSDT', 'LDOUSDT', 'IMXUSDT', 'MINAUSDT', 'BLURUSDT',
-    '1INCHUSDT', 'WOOUSDT', 'PEPEUSDT', 'FETUSDT', 'MAGICUSDT', 'TWTUSDT', 'GMXUSDT', 'HOOKUSDT', 'ROSEUSDT', 'COMPUSDT'
+    'BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','DOGEUSDT','MATICUSDT','DOTUSDT','LTCUSDT',
+    'AVAXUSDT','TRXUSDT','UNIUSDT','LINKUSDT','ATOMUSDT','FILUSDT','ETCUSDT','ICPUSDT','APTUSDT','NEARUSDT',
+    'ARBUSDT','OPUSDT','SUIUSDT','RNDRUSDT','LDOUSDT','STXUSDT','IMXUSDT','INJUSDT','WOOUSDT','FLOWUSDT',
+    'KAVAUSDT','GALAUSDT','GMTUSDT','OCEANUSDT','1INCHUSDT','PYTHUSDT','JTOUSDT','APEUSDT','BLURUSDT','MINAUSDT',
+    'FTMUSDT','DYDXUSDT','RUNEUSDT','XLMUSDT','C98USDT','WAVESUSDT','ROSEUSDT','CHZUSDT','ENJUSDT','BANDUSDT','SANDUSDT'
 ]
 
-# Estado
-last_alerts = {}
-open_positions = {}  # {symbol: {"side":..., "entry":..., "qty":..., "sl":..., "tp":..., "trailing_active":False}}
+# Evitar alertas duplicadas por 3 horas
+last_alert = {}
 
-# ================== FUNCIONES ==================
+# ==============================
+# FUNCIONES AUXILIARES
+# ==============================
 
-def get_klines(symbol):
-    """Descarga velas para indicadores"""
-    try:
-        klines = client.futures_klines(symbol=symbol, interval=INTERVAL, limit=LIMIT)
-        df = pd.DataFrame(klines, columns=[
-            'timestamp', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_av', 'trades', 'tb_base_av', 'tb_quote_av', 'ignore'
-        ])
-        df['close'] = df['close'].astype(float)
-        return df
-    except Exception as e:
-        print(f"[ERROR] No se pudo descargar velas {symbol}: {e}")
-        return None
-
-def analyze_symbol(symbol):
-    """Analiza la moneda y devuelve señal"""
-    df = get_klines(symbol)
-    if df is None or len(df) < 50:
-        return None
-
-    close = df['close']
-    rsi = RSIIndicator(close=close, window=14).rsi()
-    ema20 = EMAIndicator(close=close, window=20).ema_indicator()
-    ema50 = EMAIndicator(close=close, window=50).ema_indicator()
-    macd = MACD(close=close, window_slow=26, window_fast=12, window_sign=9)
-
-    last_rsi = rsi.iloc[-1]
-    last_ema20 = ema20.iloc[-1]
-    last_ema50 = ema50.iloc[-1]
-    last_macd = macd.macd().iloc[-1]
-    last_signal = macd.macd_signal().iloc[-1]
-    price = close.iloc[-1]
-
-    signal = None
-    confidence = 0
-
-    if last_rsi < 35 and last_ema20 > last_ema50 and last_macd > last_signal:
-        signal = "LONG"
-        confidence = 90
-    elif last_rsi > 65 and last_ema20 < last_ema50 and last_macd < last_signal:
-        signal = "SHORT"
-        confidence = 90
-    elif (last_rsi < 45 and last_macd > last_signal) or (last_rsi > 55 and last_macd < last_signal):
-        signal = "LONG" if last_rsi < 45 else "SHORT"
-        confidence = 70
-
-    if not signal:
-        return None
-
-    tp = round(price * (1.02 if signal == "LONG" else 0.98), 4)
-    sl = round(price * (0.98 if signal == "LONG" else 1.02), 4)
-
-    return {"symbol": symbol, "signal": signal, "price": price, "confidence": confidence, "tp": tp, "sl": sl}
-
-def check_news_sentiment():
-    feed = feedparser.parse(NEWS_FEED)
-    score = 50
-    if not feed.entries:
-        return score
-
-    positive = ["bullish", "rise", "up", "surge", "buy"]
-    negative = ["bearish", "fall", "down", "drop", "sell"]
-
-    count_pos, count_neg = 0, 0
-    for entry in feed.entries[:20]:
-        title = entry.title.lower()
-        if any(word in title for word in positive):
-            count_pos += 1
-        if any(word in title for word in negative):
-            count_neg += 1
-
-    if count_pos + count_neg > 0:
-        score = int((count_pos / (count_pos + count_neg)) * 100)
-    return score
-
-def can_alert(symbol):
-    last = last_alerts.get(symbol)
-    if not last:
-        return True
-    return datetime.now() - last > timedelta(hours=DUPLICATE_BLOCK_HOURS)
-
-def send_telegram(msg):
+def send_telegram(msg: str):
     try:
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
     except Exception as e:
-        print(f"[ERROR] Telegram: {e}")
+        print("Error enviando Telegram:", e)
 
-def place_futures_order(symbol, signal, price, sl, tp):
+def get_klines(symbol):
     try:
-        balance = float(client.futures_account_balance()[1]['balance'])
-        qty_usdt = balance * POSITION_SIZE_PCT
-        qty = round(qty_usdt / price, 3)
-
-        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
-
-        side = SIDE_BUY if signal == "LONG" else SIDE_SELL
-        client.futures_create_order(
-            symbol=symbol,
-            type=ORDER_TYPE_MARKET,
-            side=side,
-            quantity=qty
-        )
-
-        open_positions[symbol] = {
-            "side": signal, "entry": price, "qty": qty, "sl": sl, "tp": tp, "trailing_active": False
-        }
-
-        return qty
+        data = client.futures_klines(symbol=symbol, interval=TIMEFRAME, limit=LIMIT_CANDLES)
+        df = pd.DataFrame(data, columns=[
+            'time','o','h','l','c','v','ct','qv','n','tbb','tbq','ig'
+        ])
+        df['c'] = df['c'].astype(float)
+        df['h'] = df['h'].astype(float)
+        df['l'] = df['l'].astype(float)
+        df['v'] = df['v'].astype(float)
+        return df
     except Exception as e:
-        print(f"[ERROR] Orden {symbol}: {e}")
+        print(f"Error obteniendo velas {symbol}: {e}")
         return None
 
-def manage_positions():
-    """Verifica SL, TP y trailing stop"""
-    for symbol, pos in list(open_positions.items()):
-        price = float(client.futures_symbol_ticker(symbol=symbol)['price'])
-        side = pos["side"]
-        entry = pos["entry"]
-        sl = pos["sl"]
-        tp = pos["tp"]
-        qty = pos["qty"]
+def calculate_indicators(df):
+    # RSI
+    delta = df['c'].diff()
+    gain = delta.where(delta>0,0)
+    loss = -delta.where(delta<0,0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss
+    df['RSI'] = 100 - (100/(1+rs))
 
-        profit_pct = (price - entry) / entry if side == "LONG" else (entry - price) / entry
+    # EMA
+    df['EMA50'] = df['c'].ewm(span=50).mean()
+    df['EMA200'] = df['c'].ewm(span=200).mean()
 
-        # SL / TP
-        if (side == "LONG" and price <= sl) or (side == "SHORT" and price >= sl):
-            send_telegram(f"🔻 SL alcanzado {symbol}, cerrando posición.")
-            client.futures_create_order(symbol=symbol, side=SIDE_SELL if side=="LONG" else SIDE_BUY,
-                                        type=ORDER_TYPE_MARKET, quantity=qty)
-            open_positions.pop(symbol)
-            continue
+    # MACD
+    ema12 = df['c'].ewm(span=12).mean()
+    ema26 = df['c'].ewm(span=26).mean()
+    df['MACD'] = ema12 - ema26
+    df['Signal'] = df['MACD'].ewm(span=9).mean()
 
-        if (side == "LONG" and price >= tp) or (side == "SHORT" and price <= tp):
-            send_telegram(f"✅ TP alcanzado {symbol}, cerrando posición.")
-            client.futures_create_order(symbol=symbol, side=SIDE_SELL if side=="LONG" else SIDE_BUY,
-                                        type=ORDER_TYPE_MARKET, quantity=qty)
-            open_positions.pop(symbol)
-            continue
+    # Volumen estrategia simple
+    df['Vol_Avg'] = df['v'].rolling(20).mean()
 
-        # Trailing Stop
-        if profit_pct >= TRAILING_START:
-            if not pos["trailing_active"]:
-                pos["trailing_active"] = True
-                send_telegram(f"🎯 Trailing Stop activado para {symbol}")
+    return df
 
-            trail_price = price * (1 - TRAILING_STEP if side=="LONG" else 1 + TRAILING_STEP)
-            if (side=="LONG" and trail_price > pos["sl"]) or (side=="SHORT" and trail_price < pos["sl"]):
-                pos["sl"] = trail_price
+def get_news_sentiment():
+    try:
+        url = "https://news.google.com/rss/search?q=crypto+OR+bitcoin&hl=en-US&gl=US&ceid=US:en"
+        import feedparser
+        feed = feedparser.parse(url)
+        top_titles = [entry.title for entry in feed.entries[:5]]
+        sentiment_scores = [TextBlob(t).sentiment.polarity for t in top_titles]
+        avg_sentiment = np.mean(sentiment_scores) if sentiment_scores else 0
+        return avg_sentiment, top_titles
+    except:
+        return 0, []
 
-def analyze_all():
-    news_score = check_news_sentiment()
+def strategy_analysis(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    long_signals = 0
+    short_signals = 0
+
+    # Estrategia 1: RSI + EMA + MACD
+    if last['RSI']<30 and last['EMA50']>last['EMA200'] and last['MACD']>last['Signal']:
+        long_signals+=1
+    if last['RSI']>70 and last['EMA50']<last['EMA200'] and last['MACD']<last['Signal']:
+        short_signals+=1
+
+    # Estrategia 2: Volumen
+    if last['v']>last['Vol_Avg']*2:
+        if last['c']>prev['c']: long_signals+=1
+        else: short_signals+=1
+
+    # Estrategia 3: Cruce EMA50/200
+    if prev['EMA50']<prev['EMA200'] and last['EMA50']>last['EMA200']:
+        long_signals+=1
+    if prev['EMA50']>prev['EMA200'] and last['EMA50']<last['EMA200']:
+        short_signals+=1
+
+    # Estrategia 4: MACD cruce
+    if prev['MACD']<prev['Signal'] and last['MACD']>last['Signal']:
+        long_signals+=1
+    if prev['MACD']>prev['Signal'] and last['MACD']<last['Signal']:
+        short_signals+=1
+
+    prob_long = long_signals/4*100
+    prob_short = short_signals/4*100
+
+    return prob_long, prob_short, last['c']
+
+def check_balance_and_open(symbol, side, price):
+    try:
+        balance = float(client.futures_account_balance()[1]['balance'])
+        qty = round((balance*POSITION_SIZE_PERCENT*LEVERAGE)/price, 3)
+
+        if qty<=0:
+            send_telegram(f"Saldo insuficiente para abrir {side} en {symbol}")
+            return False
+
+        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+        client.futures_create_order(
+            symbol=symbol,
+            side=SIDE_BUY if side=="LONG" else SIDE_SELL,
+            type=FUTURE_ORDER_TYPE_MARKET,
+            quantity=qty
+        )
+        send_telegram(f"✅ Posición {side} abierta en {symbol} ({qty} contratos) @ {price}")
+        return True
+    except Exception as e:
+        send_telegram(f"❌ Error abriendo {side} en {symbol}: {e}")
+        return False
+
+def analyze_market():
+    global last_alert
+    sentiment, news = get_news_sentiment()
     for symbol in SYMBOLS:
-        data = analyze_symbol(symbol)
-        if not data:
-            continue
-        if data['confidence'] < 70 or not can_alert(symbol):
-            continue
+        df = get_klines(symbol)
+        if df is None: continue
+        df = calculate_indicators(df)
+        prob_long, prob_short, price = strategy_analysis(df)
 
-        msg = (f"⚡ Señal {data['signal']} {symbol}\n"
-               f"Precio: {data['price']}\nTP: {data['tp']} | SL: {data['sl']}\n"
-               f"Confianza: {data['confidence']}%\nSentimiento noticias: {news_score}%")
-
-        qty = None
-        if data['confidence'] >= 90:
-            qty = place_futures_order(data['symbol'], data['signal'], data['price'], data['sl'], data['tp'])
-            msg += f"\n{'✅ Posición abierta' if qty else '⚠️ No se pudo abrir posición'} x{LEVERAGE}"
-
-        send_telegram(msg)
-        last_alerts[symbol] = datetime.now()
+        now = datetime.datetime.now()
+        if prob_long>=90 or prob_short>=90:
+            last_time = last_alert.get(symbol, None)
+            if not last_time or (now-last_time).total_seconds()>10800:  # 3h
+                side = "LONG" if prob_long>prob_short else "SHORT"
+                opened = check_balance_and_open(symbol, side, price)
+                send_telegram(
+                    f"🚨 ALERTA {side} {symbol}\n"
+                    f"Precio: {price}\n"
+                    f"Confianza: {max(prob_long,prob_short):.2f}%\n"
+                    f"Sentimiento noticias: {sentiment:.2f}\n"
+                    f"Top news: {news[:2]}"
+                )
+                last_alert[symbol] = now
 
 def hourly_summary():
-    balance = float(client.futures_account_balance()[1]['balance'])
-    msg = f"📊 Resumen {datetime.now().strftime('%H:%M')}\nBalance USDT: {balance}\nPosiciones abiertas: {len(open_positions)}"
-    send_telegram(msg)
+    sentiment, news = get_news_sentiment()
+    balance = client.futures_account_balance()
+    send_telegram(f"📊 Resumen:\n"
+                  f"Balance: {balance[1]['balance']} USDT\n"
+                  f"Sentimiento: {sentiment:.2f}\n"
+                  f"Noticias: {news[:3]}")
 
-# ================== LOOP PRINCIPAL ==================
-send_telegram("🤖 Bot de trading con Trailing inicializado correctamente.")
-
-schedule.every(30).minutes.do(analyze_all)
-schedule.every(10).minutes.do(manage_positions)
-schedule.every().hour.do(hourly_summary)
+# ==============================
+# INICIO DEL BOT
+# ==============================
+send_telegram("🤖 Bot de Trading iniciado correctamente.")
+schedule.every(30).minutes.do(analyze_market)
+schedule.every(1).hours.do(hourly_summary)
 
 while True:
     schedule.run_pending()
-    time.sleep(10)
+    time.sleep(5)
