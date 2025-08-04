@@ -1,189 +1,168 @@
 import os
 import time
-import schedule
 import requests
 import pandas as pd
 import numpy as np
-from binance.client import Client
+import ccxt
 from datetime import datetime
+from ta.momentum import RSIIndicator
+from ta.trend import EMAIndicator, MACD
 from telegram import Bot
 
-# ===================== CONFIGURACIÓN =====================
-
+# =================== CONFIG ===================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
+BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-bot = Bot(token=TELEGRAM_TOKEN)
+LEVERAGE = 5
+TIMEFRAME = '15m'       # Temporalidad para análisis
+LIMIT = 200             # Velas para indicadores
+CHECK_INTERVAL = 60*60*3  # Cada 3 horas analiza nuevas entradas
+MIN_ALERT_PROB = 70
+TRADE_PROB = 90
 
-# Binance Spot sin API Key
-client = Client()
-
-# Monedas a analizar
-SYMBOLS = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","AVAXUSDT",
-    "DOTUSDT","TRXUSDT","MATICUSDT","LTCUSDT","LINKUSDT","UNIUSDT","ATOMUSDT","XMRUSDT",
-    "ALGOUSDT","FTMUSDT","SANDUSDT","AXSUSDT","NEARUSDT","AAVEUSDT","ICPUSDT","GRTUSDT",
-    "EGLDUSDT","MANAUSDT","RUNEUSDT","THETAUSDT","VETUSDT","FILUSDT","RNDRUSDT","SUIUSDT",
-    "1INCHUSDT","OCEANUSDT","PYTHUSDT","JTOUSDT","APTUSDT","ARBUSDT","OPUSDT","SEIUSDT",
-    "INJUSDT","STXUSDT","ETCUSDT","XLMUSDT","PEPEUSDT","BONKUSDT","TIAUSDT","ORDIUSDT",
-    "FETUSDT","IMXUSDT","CFXUSDT","MINAUSDT","KAVAUSDT","FLOWUSDT","GALAUSDT","CHZUSDT",
-    "DYDXUSDT","LDOUSDT","COMPUSDT","BANDUSDT"
+# Lista de símbolos a analizar
+symbols = [
+    'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT', 'DOGE/USDT', 'ADA/USDT', 'MATIC/USDT',
+    'DOT/USDT', 'LTC/USDT', 'TRX/USDT', 'AVAX/USDT', 'UNI/USDT', 'XLM/USDT', 'ATOM/USDT', 'LINK/USDT',
+    'AAVE/USDT', 'SAND/USDT', 'AXS/USDT', 'MANA/USDT', 'ICP/USDT', 'FIL/USDT', 'HBAR/USDT', 'EGLD/USDT',
+    'APT/USDT', 'AR/USDT', 'RUNE/USDT', 'FLOW/USDT', 'THETA/USDT', 'XTZ/USDT', 'GRT/USDT', '1INCH/USDT',
+    'OCEAN/USDT', 'RNDR/USDT', 'SUI/USDT', 'PYTH/USDT', 'BLUR/USDT', 'JTO/USDT', 'FTM/USDT', 'NEAR/USDT',
+    'CHZ/USDT', 'CRV/USDT', 'DYDX/USDT', 'LRC/USDT', 'ZIL/USDT', 'QTUM/USDT', 'BAND/USDT', 'COTI/USDT',
+    'ROSE/USDT', 'KAVA/USDT', 'ALGO/USDT', 'MINA/USDT', 'CFX/USDT', 'ANKR/USDT', 'GALA/USDT', 'ENS/USDT',
+    'FLUX/USDT', 'PEPE/USDT', '1000SHIB/USDT', 'WOO/USDT', 'FET/USDT', 'OP/USDT'
 ]
 
-# Evitar alertas repetidas
-last_alert_time = {}
+# =================== INIT ===================
+bot = Bot(token=TELEGRAM_TOKEN)
+exchange = ccxt.binance({
+    'apiKey': BINANCE_API_KEY,
+    'secret': BINANCE_API_SECRET,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'future'}
+})
 
-# ===================== FUNCIONES DE INDICADORES =====================
+sent_alerts = {}  # Para no repetir alertas
 
-def get_klines(symbol, interval="15m", limit=200):
-    """Descarga velas de Binance"""
+# =================== FUNCIONES ===================
+def send_telegram(msg):
     try:
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(klines, columns=[
-            "timestamp","o","h","l","c","v","close_time","qav","num_trades","tbbav","tbqav","ignore"
-        ])
-        df["c"] = df["c"].astype(float)
-        return df
+        bot.send_message(chat_id=CHAT_ID, text=msg)
     except Exception as e:
-        print(f"Error al descargar velas {symbol}: {e}")
-        return None
-
-def calculate_indicators(df):
-    """Calcula EMA, MACD y RSI"""
-    df["EMA20"] = df["c"].ewm(span=20).mean()
-    df["EMA50"] = df["c"].ewm(span=50).mean()
-
-    # MACD
-    ema12 = df["c"].ewm(span=12).mean()
-    ema26 = df["c"].ewm(span=26).mean()
-    df["MACD"] = ema12 - ema26
-    df["Signal"] = df["MACD"].ewm(span=9).mean()
-
-    # RSI
-    delta = df["c"].diff()
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(window=14).mean()
-    avg_loss = pd.Series(loss).rolling(window=14).mean()
-    rs = avg_gain / avg_loss
-    df["RSI"] = 100 - (100 / (1 + rs))
-    return df
-
-# ===================== ESTRATEGIAS =====================
-
-def strategy_signals(df):
-    """Retorna señal y estrategias cumplidas"""
-    latest = df.iloc[-1]
-    strategies = []
-
-    # Estrategia 1: EMA
-    if latest["EMA20"] > latest["EMA50"]:
-        strategies.append("EMA_BULL")
-    elif latest["EMA20"] < latest["EMA50"]:
-        strategies.append("EMA_BEAR")
-
-    # Estrategia 2: MACD
-    if latest["MACD"] > latest["Signal"]:
-        strategies.append("MACD_BULL")
-    elif latest["MACD"] < latest["Signal"]:
-        strategies.append("MACD_BEAR")
-
-    # Estrategia 3: RSI
-    if latest["RSI"] < 30:
-        strategies.append("RSI_OVERSOLD")
-    elif latest["RSI"] > 70:
-        strategies.append("RSI_OVERBOUGHT")
-
-    return strategies
-
-# ===================== NOTICIAS =====================
+        print("Error enviando Telegram:", e)
 
 def fetch_news():
-    """Obtiene noticias relevantes"""
+    url = "https://cryptopanic.com/api/v1/posts/?auth_token=demo&currencies=BTC,ETH&kind=news"
     try:
-        url = "https://cryptopanic.com/api/v1/posts/?auth_token=demo&currencies=BTC,ETH&filter=rising"
         r = requests.get(url, timeout=10)
-        data = r.json()
-        news = []
-        for post in data.get("results", [])[:3]:
-            title = post["title"]
-            url_post = post["url"]
-            news.append(f"- {title} ({url_post})")
-        return "\n".join(news)
+        if r.status_code == 200:
+            posts = r.json().get("results", [])
+            return [f"{p['title']} ({p['domain']})" for p in posts[:3]]
     except:
-        return "No se pudieron obtener noticias en este momento."
+        return []
+    return []
 
-# ===================== ALERTAS =====================
+def fetch_klines(symbol):
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=LIMIT)
+    df = pd.DataFrame(ohlcv, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+    df['close'] = df['close'].astype(float)
+    return df
 
-def send_alert(symbol, strategies, price):
-    """Envía alerta a Telegram"""
-    now = datetime.utcnow()
-    if symbol in last_alert_time:
-        if (now - last_alert_time[symbol]).total_seconds() < 1800:
-            return  # evitar alertas repetidas 30min
+def analyze_symbol(symbol):
+    df = fetch_klines(symbol)
+    if df.empty: return None
 
-    last_alert_time[symbol] = now
+    close = df['close']
 
-    direction = "LONG" if any("BULL" in s for s in strategies) else "SHORT"
-    tp = round(price * (1.02 if direction=="LONG" else 0.98), 4)
-    sl = round(price * (0.98 if direction=="LONG" else 1.02), 4)
+    # Calcular indicadores
+    rsi = RSIIndicator(close).rsi()
+    ema_fast = EMAIndicator(close, 9).ema_indicator()
+    ema_slow = EMAIndicator(close, 21).ema_indicator()
+    macd = MACD(close).macd()
+    macd_signal = MACD(close).macd_signal()
 
-    # Calcular confianza
-    strategies_count = len(strategies)
-    if strategies_count >= 3:
-        confidence = "Alta (90%)"
-    elif strategies_count == 2:
-        confidence = "Media (70%)"
-    else:
-        confidence = "Baja (50%)"
+    last_rsi = rsi.iloc[-1]
+    last_macd = macd.iloc[-1]
+    last_signal = macd_signal.iloc[-1]
+    last_ema_fast = ema_fast.iloc[-1]
+    last_ema_slow = ema_slow.iloc[-1]
+    last_price = close.iloc[-1]
 
-    msg = (
-        f"🚨 ALERTA {direction} {symbol}\n"
-        f"💰 Precio: {price}\n"
-        f"🎯 TP: {tp}\n"
-        f"🛑 SL: {sl}\n"
-        f"📊 Estrategias: {', '.join(strategies)}\n"
-        f"📈 Confianza: {confidence}\n"
-        f"📰 Noticias:\n{fetch_news()}"
-    )
-    bot.send_message(chat_id=CHAT_ID, text=msg)
+    # Estrategias
+    strat_rsi = last_rsi < 30 or last_rsi > 70
+    strat_ema = last_ema_fast > last_ema_slow
+    strat_macd = last_macd > last_signal
 
-# ===================== LOOP PRINCIPAL =====================
+    signals = [strat_rsi, strat_ema, strat_macd]
+    score = sum(signals)
+    prob = round((score / 3) * 100, 2)
 
-def analyze_market():
-    print("Analizando mercado...")
-    for symbol in SYMBOLS:
-        df = get_klines(symbol)
-        if df is None or df.empty:
+    direction = "LONG" if last_ema_fast > last_ema_slow and last_macd > last_signal else "SHORT"
+    tp = last_price * (1.02 if direction == "LONG" else 0.98)
+    sl = last_price * (0.98 if direction == "LONG" else 1.02)
+
+    return {
+        'symbol': symbol,
+        'price': last_price,
+        'prob': prob,
+        'direction': direction,
+        'tp': tp,
+        'sl': sl
+    }
+
+def check_balance_and_trade(signal):
+    try:
+        balance = exchange.fetch_balance()
+        usdt = balance['total'].get('USDT', 0)
+        if usdt < 10:
+            send_telegram(f"⚠️ No hay saldo para abrir {signal['symbol']} {signal['direction']}")
+            return False
+
+        amount = round((usdt * 0.05) / signal['price'], 3)  # 5% capital
+        params = {'positionSide': 'LONG' if signal['direction']=="LONG" else 'SHORT'}
+
+        order = exchange.create_market_order(
+            signal['symbol'].replace("/", ""),
+            'buy' if signal['direction']=="LONG" else 'sell',
+            amount,
+            params=params
+        )
+        send_telegram(f"✅ Orden abierta: {signal['symbol']} {signal['direction']} x{LEVERAGE}\n"
+                      f"Entrada: {signal['price']}\nTP: {signal['tp']}\nSL: {signal['sl']}")
+        return True
+    except Exception as e:
+        send_telegram(f"❌ Error al abrir {signal['symbol']}: {e}")
+        return False
+
+def main_loop():
+    news = fetch_news()
+    if news:
+        send_telegram("📰 Noticias recientes:\n" + "\n".join(news))
+
+    for symbol in symbols:
+        signal = analyze_symbol(symbol)
+        if not signal: 
             continue
 
-        df = calculate_indicators(df)
-        strategies = strategy_signals(df)
-        price = df["c"].iloc[-1]
+        if signal['prob'] >= MIN_ALERT_PROB:
+            alert_key = f"{symbol}_{signal['direction']}"
+            if alert_key not in sent_alerts or (time.time() - sent_alerts[alert_key]) > CHECK_INTERVAL:
+                sent_alerts[alert_key] = time.time()
+                msg = f"📊 {signal['symbol']} {signal['direction']}\n" \
+                      f"Prob: {signal['prob']}%\n" \
+                      f"Entrada: {signal['price']:.4f}\nTP: {signal['tp']:.4f} SL: {signal['sl']:.4f}"
+                send_telegram(msg)
 
-        # Contar cuántas estrategias coinciden
-        bull_count = sum(1 for s in strategies if "BULL" in s or "RSI_OVERSOLD" in s)
-        bear_count = sum(1 for s in strategies if "BEAR" in s or "RSI_OVERBOUGHT" in s)
-        if bull_count >= 2 or bear_count >= 2:
-            send_alert(symbol, strategies, price)
-
-def hourly_summary():
-    summary = f"⏰ Resumen {datetime.utcnow().strftime('%H:%M UTC')}\n"
-    summary += "Analizando mercado...\n"
-    summary += "Noticias:\n" + fetch_news()
-    bot.send_message(chat_id=CHAT_ID, text=summary)
-
-def main():
-    bot.send_message(chat_id=CHAT_ID, text="✅ Bot de trading iniciado en Render con % de confianza")
-    print("Bot iniciado correctamente")
-
-    schedule.every(30).minutes.do(analyze_market)
-    schedule.every().hour.do(hourly_summary)
-
-    while True:
-        schedule.run_pending()
-        print("Bot corriendo...")  # Heartbeat
-        time.sleep(60)
+                if signal['prob'] >= TRADE_PROB:
+                    check_balance_and_trade(signal)
 
 if __name__ == "__main__":
-    main()
+    send_telegram("🤖 Bot de Trading iniciado correctamente.")
+    while True:
+        try:
+            main_loop()
+            time.sleep(CHECK_INTERVAL)
+        except Exception as e:
+            send_telegram(f"❌ Error en el bot: {e}")
+            time.sleep(60)
