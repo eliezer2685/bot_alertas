@@ -1,164 +1,165 @@
+import ccxt
 import pandas as pd
 import numpy as np
-import requests
-import time
 import schedule
-from datetime import datetime, timedelta
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
+import time
+import datetime
+import requests
 from textblob import TextBlob
-import feedparser
 
-# ===== CONFIGURACIÓN BOT =====
-SYMBOLS = ["BTCUSDT","ETHUSDT","BNBUSDT","ADAUSDT","SOLUSDT","XRPUSDT","DOGEUSDT",
-           "AVAXUSDT","DOTUSDT","MATICUSDT","SHIBUSDT","LTCUSDT","UNIUSDT","LINKUSDT",
-           "XLMUSDT","ATOMUSDT","FILUSDT","SANDUSDT","AAVEUSDT","GALAUSDT",
-           "IMXUSDT","RNDRUSDT","FTMUSDT","OPUSDT","APTUSDT","NEARUSDT",
-           "FLOWUSDT","CFXUSDT","BLURUSDT","INJUSDT","SEIUSDT","PYTHUSDT",
-           "SUIUSDT","MINAUSDT","DYMUSDT","ENAUSDT","TIAUSDT","BEAMXUSDT",
-           "JTOUSDT","OCEANUSDT","GMTUSDT","1INCHUSDT","ICPUSDT","PEPEUSDT",
-           "WLDUSDT","BONKUSDT","ARKMUSDT","NOTUSDT","ENAUSDT","TNSRUSDT",
-           "ALTUSDT","ETHFIUSDT","PORTALUSDT","REZUSDT","ZKUSDT","ZROUSDT",
-           "TAOUSDT","JASMYUSDT","XAIUSDT","ONDOUSDT","METISUSDT"][:60]  # 60 monedas
+# ==========================
+# CONFIGURACIÓN DEL BOT
+# ==========================
+SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
+    "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "DOT/USDT", "TRX/USDT",
+    "MATIC/USDT", "SHIB/USDT", "LINK/USDT", "LTC/USDT", "BCH/USDT",
+    "OP/USDT", "IMX/USDT", "APT/USDT", "ARB/USDT", "SUI/USDT",
+    "RNDR/USDT", "INJ/USDT", "GALA/USDT", "PEPE/USDT", "PYTH/USDT",
+    "SEI/USDT", "NEAR/USDT", "JUP/USDT", "ATOM/USDT", "FTM/USDT",
+    "ALGO/USDT", "ICP/USDT", "VET/USDT", "QNT/USDT", "FLOW/USDT",
+    "EGLD/USDT", "AAVE/USDT", "HBAR/USDT", "CFX/USDT", "GRT/USDT",
+    "CHZ/USDT", "SAND/USDT", "MANA/USDT", "AXS/USDT", "THETA/USDT",
+    "FIL/USDT", "RUNE/USDT", "KAVA/USDT", "1INCH/USDT", "OCEAN/USDT",
+    "JTO/USDT", "BLUR/USDT", "GMT/USDT", "FET/USDT", "DYM/USDT",
+    "BONK/USDT", "TWT/USDT", "STX/USDT", "MINA/USDT", "SKL/USDT"
+]
 
-TIMEFRAME = '15m'   # Temporalidad
-CANDLE_LIMIT = 200   # Velas para indicadores
-ALERT_INTERVAL = 30  # minutos entre alertas por símbolo
-SUMMARY_INTERVAL = 60 # resumen cada 60 minutos
+TIMEFRAME = "15m"  # Intervalo de análisis
+MAX_CANDLES = 200  # Velas a descargar para indicadores
+ALERT_COOLDOWN = 30 * 60  # 30 minutos en segundos
 
-# ===== VARIABLES DE ESTADO =====
-client = Client()  # Para SPOT no hace falta API Key
-last_alerts = {}
-last_alert_time = {}
+# ==========================
+# INICIALIZACIÓN
+# ==========================
+exchange = ccxt.binance()
 summary_buffer = []
-persist_signals = {}
+last_alert_time = {}
 
-# ===== FUNCIONES =====
+print("Bot de alertas iniciado ✅")
+print("Analizando pares Spot de Binance cada 15 minutos...")
+print("Esperando primera señal...")
 
-def fetch_ohlcv(symbol, interval=TIMEFRAME, limit=CANDLE_LIMIT):
-    klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-    df = pd.DataFrame(klines, columns=['time','open','high','low','close','volume','close_time',
-                                       'qav','num_trades','taker_base','taker_quote','ignore'])
-    df[['open','high','low','close','volume']] = df[['open','high','low','close','volume']].astype(float)
-    return df
-
+# ==========================
+# FUNCIONES DE INDICADORES
+# ==========================
 def calculate_indicators(df):
-    # EMA
-    df['EMA20'] = df['close'].ewm(span=20).mean()
-    df['EMA50'] = df['close'].ewm(span=50).mean()
+    """Calcula RSI, EMA y MACD."""
+    df["EMA9"] = df["close"].ewm(span=9).mean()
+    df["EMA21"] = df["close"].ewm(span=21).mean()
+    
     # RSI
-    delta = df['close'].diff()
+    delta = df["close"].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
     avg_gain = gain.rolling(14).mean()
     avg_loss = loss.rolling(14).mean()
     rs = avg_gain / avg_loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    df["RSI"] = 100 - (100 / (1 + rs))
+    
     # MACD
-    df['EMA12'] = df['close'].ewm(span=12).mean()
-    df['EMA26'] = df['close'].ewm(span=26).mean()
-    df['MACD'] = df['EMA12'] - df['EMA26']
-    df['Signal'] = df['MACD'].ewm(span=9).mean()
-    # ATR
-    df["H-L"] = df["high"] - df["low"]
-    df["H-C"] = abs(df["high"] - df["close"].shift())
-    df["L-C"] = abs(df["low"] - df["close"].shift())
-    df["TR"] = df[["H-L","H-C","L-C"]].max(axis=1)
-    df["ATR"] = df["TR"].rolling(14).mean()
+    ema12 = df["close"].ewm(span=12).mean()
+    ema26 = df["close"].ewm(span=26).mean()
+    df["MACD"] = ema12 - ema26
+    df["Signal"] = df["MACD"].ewm(span=9).mean()
+
     return df
 
-def analyze_sentiment():
-    feed = feedparser.parse("https://news.google.com/rss/search?q=cryptocurrency")
-    scores = []
-    for entry in feed.entries[:5]:
-        analysis = TextBlob(entry.title)
-        scores.append(analysis.sentiment.polarity)
-    avg_score = np.mean(scores) if scores else 0
-    if avg_score > 0.1:
-        return "positivo", 5
-    elif avg_score < -0.1:
-        return "negativo", -5
-    else:
-        return "neutral", 0
+# ==========================
+# FUNCIONES DE ALERTAS
+# ==========================
+def fetch_ohlcv(symbol):
+    try:
+        candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=MAX_CANDLES)
+        df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        return df
+    except Exception as e:
+        print(f"Error descargando velas para {symbol}: {e}")
+        return None
 
-def generate_signal(df):
+def analyze_symbol(symbol):
+    df = fetch_ohlcv(symbol)
+    if df is None or len(df) < 50:
+        return None
+
+    df = calculate_indicators(df)
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    ema_cross = last.EMA20 > last.EMA50 and prev.EMA20 <= prev.EMA50
-    macd_cross = last.MACD > last.Signal and prev.MACD <= prev.Signal
-    rsi_signal = last.RSI < 30 or last.RSI > 70
-    volume_signal = last.volume > df['volume'].rolling(20).mean().iloc[-1]*1.5
+    ema_signal = last["EMA9"] > last["EMA21"]
+    macd_signal = last["MACD"] > last["Signal"]
+    rsi_signal = last["RSI"] < 30 or last["RSI"] > 70
 
-    signals = {
-        "long": ema_cross and macd_cross and last.RSI < 70,
-        "short": (last.EMA20 < last.EMA50 and last.MACD < last.Signal and last.RSI > 30),
-        "ema_macd": ema_cross and macd_cross,
-        "rsi": rsi_signal,
-        "volumen": volume_signal
-    }
-    return signals
+    # Conteo de estrategias activas
+    strategies_active = sum([ema_signal, macd_signal, rsi_signal])
 
-def send_alert(symbol, direction, price, atr, confidence, sentiment):
-    tp = price + (atr*2 if direction=="LONG" else -atr*2)
-    sl = price - (atr*1.5 if direction=="LONG" else -atr*1.5)
-    msg = (f"🚨 Señal {direction} en {symbol}\n"
-           f"Precio: {price:.4f}\n"
-           f"TP: {tp:.4f} | SL: {sl:.4f}\n"
-           f"Confianza: {confidence}% | Sentimiento: {sentiment}\n")
-    print(msg)
-    summary_buffer.append(msg)
+    if strategies_active >= 2:
+        direction = "LONG" if ema_signal else "SHORT"
+        price = last["close"]
+        tp = round(price * (1.02 if direction == "LONG" else 0.98), 4)
+        sl = round(price * (0.98 if direction == "LONG" else 1.02), 4)
+        
+        # Filtro anti-alerta repetida
+        now = time.time()
+        if symbol in last_alert_time and now - last_alert_time[symbol] < ALERT_COOLDOWN:
+            return None
+        last_alert_time[symbol] = now
 
-def analyze_symbol(symbol):
-    global last_alerts, persist_signals
-    df = fetch_ohlcv(symbol)
-    df = calculate_indicators(df)
-    signals = generate_signal(df)
-    last = df.iloc[-1]
-    atr = df["ATR"].iloc[-1]
-    price = last.close
+        msg = (f"🔔 Señal {direction} en {symbol}\n"
+               f"💰 Precio: {price}\n"
+               f"🎯 TP: {tp}\n"
+               f"🛡 SL: {sl}\n"
+               f"📊 Estrategias activas: {strategies_active}/3\n"
+               f"⏰ {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        
+        summary_buffer.append(msg)
+        print(msg)
+        return msg
+    return None
 
-    sentiment, sentiment_score = analyze_sentiment()
+def fetch_news():
+    """Obtiene titulares de noticias y calcula sentimiento."""
+    try:
+        url = "https://cryptopanic.com/api/v1/posts/?auth_token=demo&currencies=BTC"
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        titles = [r["title"] for r in data["results"][:5]]
+        
+        sentiment_scores = [TextBlob(t).sentiment.polarity for t in titles]
+        sentiment_avg = np.mean(sentiment_scores)
+        sentiment_label = "Positivo" if sentiment_avg > 0.1 else "Negativo" if sentiment_avg < -0.1 else "Neutral"
+        
+        msg = f"📰 Noticias Crypto (sentimiento {sentiment_label}):\n" + "\n".join([f"- {t}" for t in titles])
+        return msg
+    except:
+        return "No se pudieron obtener noticias."
 
-    # Estrategias combinadas
-    active_strategies = sum([signals["ema_macd"], signals["rsi"], signals["volumen"]])
-    direction = "LONG" if signals["long"] else "SHORT" if signals["short"] else None
-
-    # Persistencia 2 velas
-    prev_signal = persist_signals.get(symbol)
-    current_signal = direction
-    persist_signals[symbol] = current_signal
-
-    if prev_signal == current_signal and current_signal is not None:
-        confidence = 80 if active_strategies >= 2 else 0
-        confidence += sentiment_score
-        last_time = last_alert_time.get(symbol, datetime.min)
-        if confidence >= 75 and datetime.now()-last_time > timedelta(minutes=ALERT_INTERVAL):
-            send_alert(symbol, current_signal, price, atr, confidence, sentiment)
-            last_alert_time[symbol] = datetime.now()
-
-def analyze_all():
+def job():
     for symbol in SYMBOLS:
-        try:
-            analyze_symbol(symbol)
-        except BinanceAPIException as e:
-            print(f"Error Binance {symbol}: {e}")
-        except Exception as e:
-            print(f"Error {symbol}: {e}")
+        analyze_symbol(symbol)
 
 def send_summary():
+    print("\n=== RESUMEN ÚLTIMA HORA ===")
     if summary_buffer:
-        print("\n=== RESUMEN ÚLTIMA HORA ===")
         for msg in summary_buffer:
             print(msg)
-        print("============================\n")
         summary_buffer.clear()
+    else:
+        print("Sin alertas generadas")
+    print(fetch_news())
+    print("============================\n")
 
-# Schedulers
-schedule.every(15).minutes.do(analyze_all)
-schedule.every(SUMMARY_INTERVAL).minutes.do(send_summary)
+# ==========================
+# SCHEDULER
+# ==========================
+schedule.every(15).minutes.do(job)
+schedule.every(1).hours.do(send_summary)
 
-print("Bot de alertas iniciado ✅")
+# Primer mensaje inmediato
+send_summary()
+
 while True:
     schedule.run_pending()
-    time.sleep(1)
+    time.sleep(5)
