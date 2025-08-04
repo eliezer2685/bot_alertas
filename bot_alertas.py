@@ -1,165 +1,189 @@
-import ccxt
+import os
+import time
+import schedule
+import requests
 import pandas as pd
 import numpy as np
-import schedule
-import time
-import datetime
-import requests
-from textblob import TextBlob
+from binance.client import Client
+from datetime import datetime
+from telegram import Bot
 
-# ==========================
-# CONFIGURACIÓN DEL BOT
-# ==========================
+# ===================== CONFIGURACIÓN =====================
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+bot = Bot(token=TELEGRAM_TOKEN)
+
+# Binance Spot sin API Key
+client = Client()
+
+# Monedas a analizar
 SYMBOLS = [
-    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
-    "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "DOT/USDT", "TRX/USDT",
-    "MATIC/USDT", "SHIB/USDT", "LINK/USDT", "LTC/USDT", "BCH/USDT",
-    "OP/USDT", "IMX/USDT", "APT/USDT", "ARB/USDT", "SUI/USDT",
-    "RNDR/USDT", "INJ/USDT", "GALA/USDT", "PEPE/USDT", "PYTH/USDT",
-    "SEI/USDT", "NEAR/USDT", "JUP/USDT", "ATOM/USDT", "FTM/USDT",
-    "ALGO/USDT", "ICP/USDT", "VET/USDT", "QNT/USDT", "FLOW/USDT",
-    "EGLD/USDT", "AAVE/USDT", "HBAR/USDT", "CFX/USDT", "GRT/USDT",
-    "CHZ/USDT", "SAND/USDT", "MANA/USDT", "AXS/USDT", "THETA/USDT",
-    "FIL/USDT", "RUNE/USDT", "KAVA/USDT", "1INCH/USDT", "OCEAN/USDT",
-    "JTO/USDT", "BLUR/USDT", "GMT/USDT", "FET/USDT", "DYM/USDT",
-    "BONK/USDT", "TWT/USDT", "STX/USDT", "MINA/USDT", "SKL/USDT"
+    "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOGEUSDT","AVAXUSDT",
+    "DOTUSDT","TRXUSDT","MATICUSDT","LTCUSDT","LINKUSDT","UNIUSDT","ATOMUSDT","XMRUSDT",
+    "ALGOUSDT","FTMUSDT","SANDUSDT","AXSUSDT","NEARUSDT","AAVEUSDT","ICPUSDT","GRTUSDT",
+    "EGLDUSDT","MANAUSDT","RUNEUSDT","THETAUSDT","VETUSDT","FILUSDT","RNDRUSDT","SUIUSDT",
+    "1INCHUSDT","OCEANUSDT","PYTHUSDT","JTOUSDT","APTUSDT","ARBUSDT","OPUSDT","SEIUSDT",
+    "INJUSDT","STXUSDT","ETCUSDT","XLMUSDT","PEPEUSDT","BONKUSDT","TIAUSDT","ORDIUSDT",
+    "FETUSDT","IMXUSDT","CFXUSDT","MINAUSDT","KAVAUSDT","FLOWUSDT","GALAUSDT","CHZUSDT",
+    "DYDXUSDT","LDOUSDT","COMPUSDT","BANDUSDT"
 ]
 
-TIMEFRAME = "15m"  # Intervalo de análisis
-MAX_CANDLES = 200  # Velas a descargar para indicadores
-ALERT_COOLDOWN = 30 * 60  # 30 minutos en segundos
-
-# ==========================
-# INICIALIZACIÓN
-# ==========================
-exchange = ccxt.binance()
-summary_buffer = []
+# Evitar alertas repetidas
 last_alert_time = {}
 
-print("Bot de alertas iniciado ✅")
-print("Analizando pares Spot de Binance cada 15 minutos...")
-print("Esperando primera señal...")
+# ===================== FUNCIONES DE INDICADORES =====================
 
-# ==========================
-# FUNCIONES DE INDICADORES
-# ==========================
+def get_klines(symbol, interval="15m", limit=200):
+    """Descarga velas de Binance"""
+    try:
+        klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+        df = pd.DataFrame(klines, columns=[
+            "timestamp","o","h","l","c","v","close_time","qav","num_trades","tbbav","tbqav","ignore"
+        ])
+        df["c"] = df["c"].astype(float)
+        return df
+    except Exception as e:
+        print(f"Error al descargar velas {symbol}: {e}")
+        return None
+
 def calculate_indicators(df):
-    """Calcula RSI, EMA y MACD."""
-    df["EMA9"] = df["close"].ewm(span=9).mean()
-    df["EMA21"] = df["close"].ewm(span=21).mean()
-    
-    # RSI
-    delta = df["close"].diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-    rs = avg_gain / avg_loss
-    df["RSI"] = 100 - (100 / (1 + rs))
-    
+    """Calcula EMA, MACD y RSI"""
+    df["EMA20"] = df["c"].ewm(span=20).mean()
+    df["EMA50"] = df["c"].ewm(span=50).mean()
+
     # MACD
-    ema12 = df["close"].ewm(span=12).mean()
-    ema26 = df["close"].ewm(span=26).mean()
+    ema12 = df["c"].ewm(span=12).mean()
+    ema26 = df["c"].ewm(span=26).mean()
     df["MACD"] = ema12 - ema26
     df["Signal"] = df["MACD"].ewm(span=9).mean()
 
+    # RSI
+    delta = df["c"].diff()
+    gain = np.where(delta > 0, delta, 0)
+    loss = np.where(delta < 0, -delta, 0)
+    avg_gain = pd.Series(gain).rolling(window=14).mean()
+    avg_loss = pd.Series(loss).rolling(window=14).mean()
+    rs = avg_gain / avg_loss
+    df["RSI"] = 100 - (100 / (1 + rs))
     return df
 
-# ==========================
-# FUNCIONES DE ALERTAS
-# ==========================
-def fetch_ohlcv(symbol):
-    try:
-        candles = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=MAX_CANDLES)
-        df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        return df
-    except Exception as e:
-        print(f"Error descargando velas para {symbol}: {e}")
-        return None
+# ===================== ESTRATEGIAS =====================
 
-def analyze_symbol(symbol):
-    df = fetch_ohlcv(symbol)
-    if df is None or len(df) < 50:
-        return None
+def strategy_signals(df):
+    """Retorna señal y estrategias cumplidas"""
+    latest = df.iloc[-1]
+    strategies = []
 
-    df = calculate_indicators(df)
+    # Estrategia 1: EMA
+    if latest["EMA20"] > latest["EMA50"]:
+        strategies.append("EMA_BULL")
+    elif latest["EMA20"] < latest["EMA50"]:
+        strategies.append("EMA_BEAR")
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    # Estrategia 2: MACD
+    if latest["MACD"] > latest["Signal"]:
+        strategies.append("MACD_BULL")
+    elif latest["MACD"] < latest["Signal"]:
+        strategies.append("MACD_BEAR")
 
-    ema_signal = last["EMA9"] > last["EMA21"]
-    macd_signal = last["MACD"] > last["Signal"]
-    rsi_signal = last["RSI"] < 30 or last["RSI"] > 70
+    # Estrategia 3: RSI
+    if latest["RSI"] < 30:
+        strategies.append("RSI_OVERSOLD")
+    elif latest["RSI"] > 70:
+        strategies.append("RSI_OVERBOUGHT")
 
-    # Conteo de estrategias activas
-    strategies_active = sum([ema_signal, macd_signal, rsi_signal])
+    return strategies
 
-    if strategies_active >= 2:
-        direction = "LONG" if ema_signal else "SHORT"
-        price = last["close"]
-        tp = round(price * (1.02 if direction == "LONG" else 0.98), 4)
-        sl = round(price * (0.98 if direction == "LONG" else 1.02), 4)
-        
-        # Filtro anti-alerta repetida
-        now = time.time()
-        if symbol in last_alert_time and now - last_alert_time[symbol] < ALERT_COOLDOWN:
-            return None
-        last_alert_time[symbol] = now
-
-        msg = (f"🔔 Señal {direction} en {symbol}\n"
-               f"💰 Precio: {price}\n"
-               f"🎯 TP: {tp}\n"
-               f"🛡 SL: {sl}\n"
-               f"📊 Estrategias activas: {strategies_active}/3\n"
-               f"⏰ {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}")
-        
-        summary_buffer.append(msg)
-        print(msg)
-        return msg
-    return None
+# ===================== NOTICIAS =====================
 
 def fetch_news():
-    """Obtiene titulares de noticias y calcula sentimiento."""
+    """Obtiene noticias relevantes"""
     try:
-        url = "https://cryptopanic.com/api/v1/posts/?auth_token=demo&currencies=BTC"
-        resp = requests.get(url, timeout=10)
-        data = resp.json()
-        titles = [r["title"] for r in data["results"][:5]]
-        
-        sentiment_scores = [TextBlob(t).sentiment.polarity for t in titles]
-        sentiment_avg = np.mean(sentiment_scores)
-        sentiment_label = "Positivo" if sentiment_avg > 0.1 else "Negativo" if sentiment_avg < -0.1 else "Neutral"
-        
-        msg = f"📰 Noticias Crypto (sentimiento {sentiment_label}):\n" + "\n".join([f"- {t}" for t in titles])
-        return msg
+        url = "https://cryptopanic.com/api/v1/posts/?auth_token=demo&currencies=BTC,ETH&filter=rising"
+        r = requests.get(url, timeout=10)
+        data = r.json()
+        news = []
+        for post in data.get("results", [])[:3]:
+            title = post["title"]
+            url_post = post["url"]
+            news.append(f"- {title} ({url_post})")
+        return "\n".join(news)
     except:
-        return "No se pudieron obtener noticias."
+        return "No se pudieron obtener noticias en este momento."
 
-def job():
-    for symbol in SYMBOLS:
-        analyze_symbol(symbol)
+# ===================== ALERTAS =====================
 
-def send_summary():
-    print("\n=== RESUMEN ÚLTIMA HORA ===")
-    if summary_buffer:
-        for msg in summary_buffer:
-            print(msg)
-        summary_buffer.clear()
+def send_alert(symbol, strategies, price):
+    """Envía alerta a Telegram"""
+    now = datetime.utcnow()
+    if symbol in last_alert_time:
+        if (now - last_alert_time[symbol]).total_seconds() < 1800:
+            return  # evitar alertas repetidas 30min
+
+    last_alert_time[symbol] = now
+
+    direction = "LONG" if any("BULL" in s for s in strategies) else "SHORT"
+    tp = round(price * (1.02 if direction=="LONG" else 0.98), 4)
+    sl = round(price * (0.98 if direction=="LONG" else 1.02), 4)
+
+    # Calcular confianza
+    strategies_count = len(strategies)
+    if strategies_count >= 3:
+        confidence = "Alta (90%)"
+    elif strategies_count == 2:
+        confidence = "Media (70%)"
     else:
-        print("Sin alertas generadas")
-    print(fetch_news())
-    print("============================\n")
+        confidence = "Baja (50%)"
 
-# ==========================
-# SCHEDULER
-# ==========================
-schedule.every(15).minutes.do(job)
-schedule.every(1).hours.do(send_summary)
+    msg = (
+        f"🚨 ALERTA {direction} {symbol}\n"
+        f"💰 Precio: {price}\n"
+        f"🎯 TP: {tp}\n"
+        f"🛑 SL: {sl}\n"
+        f"📊 Estrategias: {', '.join(strategies)}\n"
+        f"📈 Confianza: {confidence}\n"
+        f"📰 Noticias:\n{fetch_news()}"
+    )
+    bot.send_message(chat_id=CHAT_ID, text=msg)
 
-# Primer mensaje inmediato
-send_summary()
+# ===================== LOOP PRINCIPAL =====================
 
-while True:
-    schedule.run_pending()
-    time.sleep(5)
+def analyze_market():
+    print("Analizando mercado...")
+    for symbol in SYMBOLS:
+        df = get_klines(symbol)
+        if df is None or df.empty:
+            continue
+
+        df = calculate_indicators(df)
+        strategies = strategy_signals(df)
+        price = df["c"].iloc[-1]
+
+        # Contar cuántas estrategias coinciden
+        bull_count = sum(1 for s in strategies if "BULL" in s or "RSI_OVERSOLD" in s)
+        bear_count = sum(1 for s in strategies if "BEAR" in s or "RSI_OVERBOUGHT" in s)
+        if bull_count >= 2 or bear_count >= 2:
+            send_alert(symbol, strategies, price)
+
+def hourly_summary():
+    summary = f"⏰ Resumen {datetime.utcnow().strftime('%H:%M UTC')}\n"
+    summary += "Analizando mercado...\n"
+    summary += "Noticias:\n" + fetch_news()
+    bot.send_message(chat_id=CHAT_ID, text=summary)
+
+def main():
+    bot.send_message(chat_id=CHAT_ID, text="✅ Bot de trading iniciado en Render con % de confianza")
+    print("Bot iniciado correctamente")
+
+    schedule.every(30).minutes.do(analyze_market)
+    schedule.every().hour.do(hourly_summary)
+
+    while True:
+        schedule.run_pending()
+        print("Bot corriendo...")  # Heartbeat
+        time.sleep(60)
+
+if __name__ == "__main__":
+    main()
