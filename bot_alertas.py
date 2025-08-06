@@ -1,218 +1,185 @@
-import os, time, datetime, requests, csv
+import os
+import time
+import json
+import datetime
 import pandas as pd
-import numpy as np
-import schedule
+import requests
 import feedparser
+import schedule
 from textblob import TextBlob
 from binance.client import Client
+import ta
 from telegram import Bot
 
-# ================== CONFIGURACIÓN ==================
+# ==============================
+# Configuración
+# ==============================
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 
-if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    print("❌ ERROR: Variables de entorno no configuradas.")
-    exit()
-
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# Cliente Binance solo para Spot (no necesitamos API Key para precios)
-client = Client("", "")
-
-# Lista de 60 monedas Spot populares
-symbols = [
+# Monedas a analizar inicialmente (spot)
+ALL_SYMBOLS = [
     "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","SOLUSDT","DOGEUSDT","ADAUSDT","TRXUSDT","MATICUSDT","LTCUSDT",
     "DOTUSDT","SHIBUSDT","AVAXUSDT","UNIUSDT","ATOMUSDT","LINKUSDT","XLMUSDT","FILUSDT","ICPUSDT","APTUSDT",
     "ARBUSDT","SANDUSDT","MANAUSDT","APEUSDT","AXSUSDT","NEARUSDT","EOSUSDT","FLOWUSDT","XTZUSDT","THETAUSDT",
     "AAVEUSDT","GRTUSDT","RUNEUSDT","KAVAUSDT","CRVUSDT","FTMUSDT","CHZUSDT","SNXUSDT","LDOUSDT","OPUSDT",
     "COMPUSDT","DYDXUSDT","BLURUSDT","RNDRUSDT","GMTUSDT","1INCHUSDT","OCEANUSDT","SUIUSDT","PYTHUSDT","JTOUSDT",
-    "PEPEUSDT","SEIUSDT","WLDUSDT","BONKUSDT","TIAUSDT","BEAMXUSDT","STRKUSDT","STXUSDT","ARKMUSDT","ORDIUSDT"
+    "SEIUSDT","TIAUSDT","BONKUSDT","STXUSDT","FTTUSDT","WOOUSDT","BANDUSDT","KSMUSDT","ZECUSDT","ROSEUSDT"
 ]
 
-TOP_MONEDAS_DIARIAS = 10
-COOLDOWN_ALERTA = 3 * 3600  # 3 horas
-INTERVALO_VELAS = "15m"
-VELAS_LIMIT = 200  # ≈ 2 días de histórico
-TP_PORC = 0.02
-SL_PORC = 0.02
+TOP10_FILE = "last_coins.json"
+HISTORICO_FILE = "historico_senales.csv"
 
-# RSS noticias cripto
-news_feeds = [
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
-    "https://cointelegraph.com/rss",
-    "https://news.bitcoin.com/feed/",
-    "https://cryptoslate.com/feed/",
-    "https://decrypt.co/feed",
-    "https://bitcoinmagazine.com/feed",
-    "https://u.today/rss",
-    "https://ambcrypto.com/feed/",
-    "https://cryptopotato.com/feed/",
-    "https://beincrypto.com/feed/"
-]
+# Binance client solo para spot
+client = Client()
 
-# Variables en memoria
-top_monedas = []
-ultima_alerta = {}
-trades_activos = {}
+# ==============================
+# Funciones de análisis
+# ==============================
 
-# ================== FUNCIONES ==================
-def obtener_velas(symbol, interval=INTERVALO_VELAS, limit=VELAS_LIMIT):
-    """Descarga velas de Binance y retorna DataFrame"""
-    try:
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
-        df = pd.DataFrame(klines, columns=[
-            "timestamp","open","high","low","close","volume","close_time","qav","num_trades","taker_base_vol","taker_quote_vol","ignore"
-        ])
-        df["close"] = df["close"].astype(float)
-        df["volume"] = df["volume"].astype(float)
-        return df
-    except:
-        return None
+def get_historical(symbol, interval='15m', lookback='200'):
+    """Descarga velas de Binance para calcular indicadores"""
+    klines = client.get_klines(symbol=symbol, interval=interval, limit=int(lookback))
+    df = pd.DataFrame(klines, columns=[
+        'timestamp','open','high','low','close','volume',
+        'close_time','quote_av','trades','tb_base_av','tb_quote_av','ignore'
+    ])
+    df['close'] = pd.to_numeric(df['close'])
+    df['volume'] = pd.to_numeric(df['volume'])
+    return df
 
 def check_news(symbol):
-    """Analiza noticias y devuelve sentimiento"""
+    """Analiza últimas noticias y devuelve sentimiento"""
     keyword = symbol.replace("USDT", "")
-    for feed in news_feeds:
+    feeds = [
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://cointelegraph.com/rss",
+        "https://news.bitcoin.com/feed/"
+    ]
+    for feed in feeds:
         d = feedparser.parse(feed)
         for entry in d.entries[:5]:
             title = entry.title
             if keyword.lower() in title.lower():
                 sentiment = TextBlob(title).sentiment.polarity
                 if sentiment > 0.1:
-                    return f"🟢 Positiva: \"{title}\""
+                    return f"🟢 Noticia positiva: \"{title}\""
                 elif sentiment < -0.1:
-                    return f"🔴 Negativa: \"{title}\""
+                    return f"🔴 Noticia negativa: \"{title}\""
     return None
 
-def calcular_probabilidad(df):
-    """Evalúa las 4 estrategias y devuelve dirección (LONG/SHORT), probabilidad y estrategias activas"""
-    estrategias = []
-    prob = 0
-    direccion = None
+def analyze_symbol(symbol):
+    """Calcula indicadores y devuelve señal si aplica"""
+    try:
+        df = get_historical(symbol)
+        if df.empty or len(df) < 50:
+            return None
 
-    # ===== Estrategia 1: MACD + EMA + RSI =====
-    df["EMA50"] = df["close"].ewm(span=50).mean()
-    df["EMA200"] = df["close"].ewm(span=200).mean()
-    df["RSI"] = calcular_RSI(df["close"])
-    macd_line, signal_line = calcular_MACD(df["close"])
+        # Indicadores
+        df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+        macd = ta.trend.MACD(df['close'])
+        df['macd'] = macd.macd()
+        df['macd_signal'] = macd.macd_signal()
+        df['ema50'] = ta.trend.EMAIndicator(df['close'], window=50).ema_indicator()
+        df['ema200'] = ta.trend.EMAIndicator(df['close'], window=200).ema_indicator()
+        df['vol_ma20'] = df['volume'].rolling(20).mean()
 
-    close = df["close"].iloc[-1]
-    rsi = df["RSI"].iloc[-1]
-    macd_val = macd_line.iloc[-1]
-    signal_val = signal_line.iloc[-1]
-    ema50 = df["EMA50"].iloc[-1]
-    ema200 = df["EMA200"].iloc[-1]
+        last = df.iloc[-1]
+        price = last['close']
+        rsi = last['rsi']
+        macd_val = last['macd']
+        macd_signal = last['macd_signal']
+        ema50 = last['ema50']
+        ema200 = last['ema200']
+        vol = last['volume']
+        vol_ma = last['vol_ma20']
 
-    if rsi < 30 and macd_val > signal_val and ema50 > ema200:
-        prob += 30
-        estrategias.append("MACD+EMA+RSI")
-        direccion = "LONG"
-    elif rsi > 70 and macd_val < signal_val and ema50 < ema200:
-        prob += 30
-        estrategias.append("MACD+EMA+RSI")
-        direccion = "SHORT"
+        # Estrategias
+        strat1 = (rsi < 30 and macd_val > macd_signal and ema50 > ema200) or \
+                 (rsi > 70 and macd_val < macd_signal and ema50 < ema200)
+        strat2 = vol > vol_ma * 1.5
+        strat3 = check_news(symbol) is not None
+        strat4 = (ema50 > ema200 and macd_val > macd_signal) or \
+                 (ema50 < ema200 and macd_val < macd_signal)
 
-    # ===== Estrategia 2: Volumen / Tendencia =====
-    vol_prom = df["volume"].iloc[-20:].mean()
-    vol_ult = df["volume"].iloc[-1]
-    if vol_ult > 1.5 * vol_prom:
-        prob += 20
-        estrategias.append("Volumen")
-        if direccion is None:
-            direccion = "LONG" if df["close"].iloc[-1] > df["close"].iloc[-2] else "SHORT"
+        active_strats = sum([strat1, strat2, strat3, strat4])
+        prob = active_strats / 4 * 100
 
-    # ===== Estrategia 3: Noticias =====
-    # Evaluamos afuera en la alerta final
+        if prob >= 70:
+            signal = "LONG" if macd_val > macd_signal else "SHORT"
+            tp = round(price * (1.02 if signal == "LONG" else 0.98), 6)
+            sl = round(price * (0.98 if signal == "LONG" else 1.02), 6)
+            return {
+                "symbol": symbol,
+                "signal": signal,
+                "price": price,
+                "tp": tp,
+                "sl": sl,
+                "prob": prob,
+                "news": check_news(symbol)
+            }
+        return None
+    except Exception as e:
+        print(f"⚠️ Error analizando {symbol}: {e}")
+        return None
 
-    # ===== Estrategia 4: Confirmación multi-indicadores =====
-    if direccion and (
-        (direccion=="LONG" and close>ema50 and macd_val>signal_val) or
-        (direccion=="SHORT" and close<ema50 and macd_val<signal_val)
-    ):
-        prob += 25
-        estrategias.append("MultiConfirmación")
+# ==============================
+# Selección diaria
+# ==============================
 
-    return direccion, prob, estrategias
+def select_top10():
+    print("🔹 Generando lista top10...")
+    signals = []
+    for sym in ALL_SYMBOLS:
+        res = analyze_symbol(sym)
+        if res:
+            signals.append(res)
+    top = sorted(signals, key=lambda x: x['prob'], reverse=True)[:10]
+    with open(TOP10_FILE, 'w') as f:
+        json.dump([t['symbol'] for t in top], f)
+    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"✅ Top10 generado: {[t['symbol'] for t in top]}")
 
-def calcular_RSI(series, period=14):
-    delta = series.diff()
-    gain = delta.where(delta>0, 0)
-    loss = -delta.where(delta<0, 0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
-    rs = avg_gain/avg_loss
-    return 100 - (100/(1+rs))
+# ==============================
+# Análisis intradía
+# ==============================
 
-def calcular_MACD(series, fast=12, slow=26, signal=9):
-    exp1 = series.ewm(span=fast, adjust=False).mean()
-    exp2 = series.ewm(span=slow, adjust=False).mean()
-    macd = exp1 - exp2
-    signal_line = macd.ewm(span=signal, adjust=False).mean()
-    return macd, signal_line
+def analyze_intraday():
+    if not os.path.exists(TOP10_FILE):
+        select_top10()
 
-def enviar_alerta(symbol, direccion, prob, price, estrategias, news):
-    tp = price * (1+TP_PORC if direccion=="LONG" else 1-TP_PORC)
-    sl = price * (1-SL_PORC if direccion=="LONG" else 1+SL_PORC)
-    msg = (
-        f"🔔 Señal {direccion}\n"
-        f"Moneda: {symbol}\n"
-        f"Probabilidad: {prob}%\n"
-        f"Precio entrada: {price:.4f}\n"
-        f"TP: {tp:.4f} | SL: {sl:.4f}\n"
-        f"Estrategias: {', '.join(estrategias)}\n"
-    )
-    if news:
-        msg += f"Noticias: {news}\n"
+    with open(TOP10_FILE) as f:
+        top10 = json.load(f)
 
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-    ultima_alerta[symbol] = time.time()
-    trades_activos[symbol] = {"direccion": direccion, "entrada": price, "tp": tp, "sl": sl}
+    alerts = []
+    for sym in top10:
+        res = analyze_symbol(sym)
+        if res:
+            msg = (
+                f"🔔 Señal Detectada {res['signal']}\n"
+                f"Moneda: {res['symbol']}\n"
+                f"Probabilidad: {res['prob']:.0f}%\n"
+                f"Precio Entrada: {res['price']}\n"
+                f"TP: {res['tp']}\nSL: {res['sl']}\n"
+            )
+            if res['news']:
+                msg += f"{res['news']}\n"
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
+            alerts.append(res['symbol'])
+    print(f"📊 Analizado intradía, alertas: {alerts}")
 
-def seleccionar_top_monedas():
-    global top_monedas
-    resultados = []
-    for sym in symbols:
-        df = obtener_velas(sym)
-        if df is None: continue
-        direccion, prob, estrategias = calcular_probabilidad(df)
-        resultados.append((sym, prob))
-    resultados.sort(key=lambda x:x[1], reverse=True)
-    top_monedas = [r[0] for r in resultados[:TOP_MONEDAS_DIARIAS]]
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"🌅 Top {TOP_MONEDAS_DIARIAS} monedas de hoy: {', '.join(top_monedas)}")
+# ==============================
+# Scheduler
+# ==============================
 
-def analizar_monedas():
-    ahora = time.time()
-    for sym in top_monedas:
-        df = obtener_velas(sym)
-        if df is None: continue
-        price = df["close"].iloc[-1]
-        direccion, prob, estrategias = calcular_probabilidad(df)
-        news = check_news(sym)
-        if news: 
-            prob += 25
-            estrategias.append("Noticias")
+schedule.every().day.at("06:00").do(select_top10)
+schedule.every(1).hours.do(lambda: select_top10() if not os.path.exists(TOP10_FILE) else None)
+schedule.every(15).minutes.do(analyze_intraday)
 
-        if prob >= 70 and (sym not in ultima_alerta or ahora-ultima_alerta[sym]>COOLDOWN_ALERTA):
-            enviar_alerta(sym, direccion, prob, price, estrategias, news)
-
-def resumen_horario():
-    msg = f"⏰ Resumen {datetime.datetime.now().strftime('%H:%M')}\n"
-    msg += f"Monedas analizadas: {len(top_monedas)}\n"
-    msg += f"Trades activos: {len(trades_activos)}\n"
-    for sym, trade in trades_activos.items():
-        precio_actual = obtener_velas(sym)["close"].iloc[-1]
-        msg += f"- {sym} {trade['direccion']} | Entrada {trade['entrada']:.4f} | Actual {precio_actual:.4f}\n"
-    bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg)
-
-# ================== SCHEDULER ==================
-schedule.every().day.at("06:00").do(seleccionar_top_monedas)
-schedule.every(15).minutes.do(analizar_monedas)
-schedule.every().hour.do(resumen_horario)
-
-bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot de alertas iniciado correctamente.")
-
-print("✅ Bot iniciado. Analiza top monedas cada 15 min y envía resúmenes cada hora.")
+bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="🚀 Bot de alertas iniciado correctamente...")
+print("✅ Bot iniciado")
 
 while True:
     schedule.run_pending()
