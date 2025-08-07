@@ -36,7 +36,7 @@ LAST_COINS_FILE = "last_coins.json"
 SENT_ALERTS_FILE = "sent_alerts.json"
 FAILED_COUNT_FILE = "failed_counts.json"
 
-# ===🗞️ FEEDS DE NOTICIAS ===
+# ===🗕️ FEEDS DE NOTICIAS ===
 NEWS_FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
@@ -204,7 +204,8 @@ def send_alerts():
     sent[today] = alerts_today
     save_json(SENT_ALERTS_FILE, sent)
     save_json(FAILED_COUNT_FILE, failed)
-    save_json(LAST_COINS_FILE, {"date": today, "symbols": filtered_symbols})
+    data["symbols"] = filtered_symbols
+    save_json(LAST_COINS_FILE, data)
 
 # ===📊 RESUMEN CADA HORA ===
 def send_summary():
@@ -213,7 +214,7 @@ def send_summary():
     selected = data.get("symbols", [])
     bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=f"⏱️ Bot activo {now}. Monedas analizadas: {selected}")
 
-# ===🕓 SCHEDULER ===
+# ===⌐ SCHEDULER ===
 schedule.every().day.at("06:00").do(initialize_daily_selection)
 schedule.every().hour.do(initialize_daily_selection)
 schedule.every(15).minutes.do(send_alerts)
